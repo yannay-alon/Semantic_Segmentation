@@ -3,6 +3,8 @@ from PIL import Image
 import tarfile
 import io
 import re
+import numpy as np
+import BasicModel
 
 
 # <editor-fold desc="Read from VOC tar">
@@ -78,6 +80,34 @@ def get_annotations(tar: tarfile.TarFile, image_name: str) -> List[dict]:
 
 # </editor-fold>
 
+def get_matching_pixels(colored_image: Image.Image, labeled_image: Image.Image) -> dict:
+    """
+    Get all pixels matching to each class in the image
+    
+    :param colored_image: image to be scraped
+    :param labeled_image: same image - labeled
+    :return: A dictionary with matching pixel for each class in the image
+    """
+    colored_image = np.array(colored_image).reshape(-1, 3)
+    labeled_image = np.array(labeled_image).reshape(-1)
+    classes_colors = []
+    pixels = {}
+    for pixel_index, pixel_color in enumerate(labeled_image):
+        class_color = pixel_color
+        if class_color not in classes_colors:
+            classes_colors.append(class_color)
+
+        pixel = list(colored_image[pixel_index])
+        if class_color in pixels:
+            pixels[class_color].append(pixel)
+        else:
+            pixels[class_color] = [pixel]
+    return pixels
+
+# - what is this for?
+# - later mean and var of all classes may be needed
+
+
 def main():
     tar = tarfile.open("VOC_DATA.tar")
 
@@ -89,6 +119,15 @@ def main():
 
     annotated_image = get_image(tar, image_name, "class")
     image = get_image(tar, image_name)
+
+    #image.show()
+    #annotated_image.show()
+    # --------------------------------------------------------------------------------- #
+    classes_colors = get_matching_pixels(image, annotated_image)
+    print(classes_colors)
+
+    MRF = BasicModel.MRFModel()
+    MRF.fit()
 
 
 if __name__ == '__main__':
