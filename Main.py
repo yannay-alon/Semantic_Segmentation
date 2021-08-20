@@ -101,7 +101,8 @@ def main():
     palette = annotated_image.getpalette()
 
     # --------------------------------------------------------------------------------- #
-    MRF = BasicModel.MRFModel()
+
+    MRF = BasicModel.MRFModel(palette)
     MRF.fit([image], [annotated_image])
     prediction = MRF.predict(image)
 
