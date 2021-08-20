@@ -71,7 +71,7 @@ class AdvancedModel(BaseModel, nn.Module):
 
             # 13
             nn.Conv2d(in_channels=num_labels, out_channels=num_labels * num_mixture_filters,
-                      kernel_size=(9, 9), stride=(1, 1, 1)),
+                      kernel_size=(9, 9), stride=(1, 1)),
             nn.Linear(in_features=num_labels * num_mixture_filters, out_features=num_labels * num_mixture_filters),
 
             # 14 - block min pooling
