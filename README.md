@@ -1,3 +1,1 @@
-PEE PEE POO POO
-IM A READ ME
-LMIDA PROJECT LETS GOOOOO!!!
+Semantic segmentation using MRF based model
