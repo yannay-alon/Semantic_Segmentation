@@ -49,7 +49,7 @@ class MRFModel(BaseModel):
         self.beta = beta  # doubleton potential
         self.class_info = {}
 
-    def fit(self, images, labeled_images):
+    def fit(self, images: List[Image.Image], labeled_images: List[Image.Image]):
         # initial probabilities from training data
         # for each color
 
@@ -65,7 +65,7 @@ class MRFModel(BaseModel):
 
             self.class_info[label] = (class_prior_prob, class_mean, class_var)
 
-    def predict(self, image):
+    def predict(self, image: Image.Image):
         image = np.array(image)
         predict_image = np.zeros(image.shape)
         for i in range(image.shape[0]):
