@@ -45,9 +45,9 @@ def normal_pdf(x, mean, var):
 
 
 class MRFModel(BaseModel):
-    def __init__(self, palette, beta=100):
+    def __init__(self, palette, beta=10000):
         self.beta = beta  # doubleton potential
-        self.neighbors_indices = [[0, 1], [0, -1], [1, 0], [-1, 0]]  # neighbors included in energy calculation
+        self.neighbors_indices = [[0, 1], [0, -1], [1, 0], [-1, 0], [1,1], [1,-1],[-1,1],[-1,-1]]  # neighbors included in energy calculation
         self.class_info = {}
         self.palette = palette
 
@@ -59,7 +59,7 @@ class MRFModel(BaseModel):
             value = image[i][j][color]
             energy += np.log(np.sqrt(2 * np.pi * var)) + ((value - mean) ** 2) / (2 * var)
         for a, b in self.neighbors_indices:
-            a += j
+            a += i
             b += j
             if 0 <= a < image.shape[0] and 0 <= b < image.shape[1]:
                 energy += self.beta * (-1 if interpretation[i][j] == interpretation[a][b] else 1)
@@ -84,21 +84,29 @@ class MRFModel(BaseModel):
         current_energy = self.calculate_energy(image, interpretation)
         current_tmp = initial_temp
         iteration = 0
+
         while iteration < iterations:
+
             i = random.randint(0, image.shape[0] - 1)
             j = random.randint(0, image.shape[1] - 1)
 
             possible_classes = list(self.class_info.keys())
             possible_classes.remove(interpretation[i, j])
-            new_class = random.choice(possible_classes)
-            delta = self.delta_energy(image, interpretation, (i, j), new_class)
+            best_delta = 0
+            best_class = 0
+            for new_class in possible_classes:
+                delta = self.delta_energy(image, interpretation, (i, j), new_class)
+                if delta < best_delta:
+                    best_delta = delta
+                    best_class = new_class
 
-            if delta <= 0:
-                interpretation[i][j] = new_class
-                current_energy += delta
-                #print("CHANGED better")
+            if best_delta < 0:
+                interpretation[i][j] = best_class
+                current_energy += best_delta
+                # print("CHANGED better")
+
             else:
-                if current_tmp == 0 or -delta / current_tmp < -600:
+                if current_tmp <= 0.0001 or -delta / current_tmp < -600:
                     k = 0
                 else:
                     k = np.exp(-delta / current_tmp)
@@ -108,12 +116,13 @@ class MRFModel(BaseModel):
                     interpretation[i][j] = new_class
                     current_energy += delta
 
-            if iteration % 1000 == 0:
+
+            if iteration % 100000 == 0:
                 predicted_image = Image.fromarray(interpretation.astype(np.uint8), mode="P")
                 predicted_image.putpalette(self.palette)
                 predicted_image.show()
 
-            current_tmp /= (1 + iteration)  # linear cooling - possible to try logarithmic cooling
+            current_tmp /= 1 + np.log(1 + iteration)  # linear cooling - possible to try logarithmic cooling
             iteration += 1
 
         return interpretation
@@ -125,12 +134,17 @@ class MRFModel(BaseModel):
         class_pixels = get_total_matching_pixels(images, labeled_images)
         total_number_of_pixels = sum(len(number_pixels) for number_pixels in class_pixels.values())
 
+        del class_pixels[255]
         for label in class_pixels:
             pixels = np.array(class_pixels[label])
             class_mean = np.mean(pixels, 0)
             class_var = np.var(pixels, 0)
             class_freq = len(pixels)
-            class_prior_prob = class_freq / total_number_of_pixels
+            class_prior_prob = np.log(1 + class_freq / total_number_of_pixels)
+            #class_prior_prob = 1 / np.sqrt(np.linalg.norm(class_var))
+            #if label == 255:
+            #    class_prior_prob = 0
+            #    class_var = [100000000000000000000000] * 3
 
             self.class_info[label] = (class_prior_prob, class_mean, class_var)
 
@@ -161,7 +175,5 @@ class MRFModel(BaseModel):
     def predict(self, image: Image.Image):
         image = np.array(image)
         initial_interpretation = self.naive_bayes_prediction(image)
-        #initial_interpretation = np.zeros(image.shape[:-1]) + 1
-        return self.simulated_annealing(image, initial_interpretation, iterations=10000)
-
-
+        # initial_interpretation = np.zeros(image.shape[:-1]) + 1
+        return self.simulated_annealing(image, initial_interpretation, iterations=1000000)

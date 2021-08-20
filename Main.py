@@ -95,8 +95,8 @@ def main():
     annotated_image = get_image(tar, image_name, "class")
     image = get_image(tar, image_name)
 
-    # image.show()
-    # annotated_image.show()
+    image.show()
+    annotated_image.show()
 
     palette = annotated_image.getpalette()
 
