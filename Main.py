@@ -83,9 +83,8 @@ def get_annotations(tar: tarfile.TarFile, image_name: str) -> List[dict]:
 # </editor-fold>
 
 
-
 def main():
-    tar = tarfile.open("VOC_DATA.tar")
+    tar = tarfile.open(f"{VOC_TAR_PATH}.tar")
 
     train_file_paths = get_dataset_paths(tar, "train")
     val_file_paths = get_dataset_paths(tar, "val")
@@ -99,14 +98,16 @@ def main():
     # image.show()
     # annotated_image.show()
 
+    palette = annotated_image.getpalette()
+
     # --------------------------------------------------------------------------------- #
     MRF = BasicModel.MRFModel()
     MRF.fit([image], [annotated_image])
-    prediction = MRF.predict(image).astype(np.int)
-    print(prediction)
-    print(prediction.shape)
-    prediction = Image.fromarray(prediction)
-    prediction.show()
+    prediction = MRF.predict(image)
+
+    predicted_image = Image.fromarray(prediction.astype(np.uint8), mode="P")
+    predicted_image.putpalette(palette)
+    predicted_image.show()
 
 
 if __name__ == '__main__':

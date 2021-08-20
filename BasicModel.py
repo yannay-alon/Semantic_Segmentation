@@ -67,7 +67,7 @@ class MRFModel(BaseModel):
 
     def predict(self, image: Image.Image):
         image = np.array(image)
-        predict_image = np.zeros(image.shape)
+        predict_image = np.zeros(image.shape[:-1])
         for i in range(image.shape[0]):
             for j in range(image.shape[1]):
                 max_prob = 0
