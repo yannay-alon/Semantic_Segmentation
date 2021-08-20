@@ -7,6 +7,8 @@ import numpy as np
 import BasicModel
 
 VOC_TAR_PATH = "VOCtrainval_11-May-2012"
+
+
 # <editor-fold desc="Read from VOC tar">
 def get_image(tar: tarfile.TarFile, image_name: str, annotations: Optional[str] = None) -> Image.Image:
     """
