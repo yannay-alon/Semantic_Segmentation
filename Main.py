@@ -82,34 +82,10 @@ def get_annotations(tar: tarfile.TarFile, image_name: str) -> List[dict]:
 
 # </editor-fold>
 
-def get_matching_pixels(colored_image: Image.Image, labeled_image: Image.Image) -> dict:
-    """
-    Get all pixels_class matching to each class in the image
-    
-    :param colored_image: image to be scraped
-    :param labeled_image: same image - labeled
-    :return: A dictionary with matching pixel for each class in the image
-    """
-    colored_image = np.array(colored_image)
-    labeled_image = np.array(labeled_image)
-    pixels_class = {}
-
-    for pixel_index, pixel_color in np.ndenumerate(labeled_image):
-        colored_pixel_value = colored_image[pixel_index].tolist()
-        if pixel_color in pixels_class:
-            pixels_class[pixel_color].append(colored_pixel_value)
-        else:
-            pixels_class[pixel_color] = [colored_pixel_value]
-
-    return pixels_class
-
-
-# - what is this for?
-# - later mean and var of all classes may be needed
 
 
 def main():
-    tar = tarfile.open("VOCtrainval_11-May-2012.tar")
+    tar = tarfile.open("VOC_DATA.tar")
 
     train_file_paths = get_dataset_paths(tar, "train")
     val_file_paths = get_dataset_paths(tar, "val")
@@ -124,12 +100,13 @@ def main():
     # annotated_image.show()
 
     # --------------------------------------------------------------------------------- #
-
-    classes_colors = get_matching_pixels(image, annotated_image)
-    print(classes_colors)
-
     MRF = BasicModel.MRFModel()
-    MRF.fit()
+    MRF.fit([image], [annotated_image])
+    prediction = MRF.predict(image).astype(np.int)
+    print(prediction)
+    print(prediction.shape)
+    prediction = Image.fromarray(prediction)
+    prediction.show()
 
 
 if __name__ == '__main__':
