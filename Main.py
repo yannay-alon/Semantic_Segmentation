@@ -6,7 +6,7 @@ import re
 import numpy as np
 import BasicModel
 
-
+VOC_TAR_PATH = "VOCtrainval_11-May-2012"
 # <editor-fold desc="Read from VOC tar">
 def get_image(tar: tarfile.TarFile, image_name: str, annotations: Optional[str] = None) -> Image.Image:
     """
@@ -82,34 +82,32 @@ def get_annotations(tar: tarfile.TarFile, image_name: str) -> List[dict]:
 
 def get_matching_pixels(colored_image: Image.Image, labeled_image: Image.Image) -> dict:
     """
-    Get all pixels matching to each class in the image
+    Get all pixels_class matching to each class in the image
     
     :param colored_image: image to be scraped
     :param labeled_image: same image - labeled
     :return: A dictionary with matching pixel for each class in the image
     """
-    colored_image = np.array(colored_image).reshape(-1, 3)
-    labeled_image = np.array(labeled_image).reshape(-1)
-    classes_colors = []
-    pixels = {}
-    for pixel_index, pixel_color in enumerate(labeled_image):
-        class_color = pixel_color
-        if class_color not in classes_colors:
-            classes_colors.append(class_color)
+    colored_image = np.array(colored_image)
+    labeled_image = np.array(labeled_image)
+    pixels_class = {}
 
-        pixel = list(colored_image[pixel_index])
-        if class_color in pixels:
-            pixels[class_color].append(pixel)
+    for pixel_index, pixel_color in np.ndenumerate(labeled_image):
+        colored_pixel_value = colored_image[pixel_index].tolist()
+        if pixel_color in pixels_class:
+            pixels_class[pixel_color].append(colored_pixel_value)
         else:
-            pixels[class_color] = [pixel]
-    return pixels
+            pixels_class[pixel_color] = [colored_pixel_value]
+
+    return pixels_class
+
 
 # - what is this for?
 # - later mean and var of all classes may be needed
 
 
 def main():
-    tar = tarfile.open("VOC_DATA.tar")
+    tar = tarfile.open("VOCtrainval_11-May-2012.tar")
 
     train_file_paths = get_dataset_paths(tar, "train")
     val_file_paths = get_dataset_paths(tar, "val")
@@ -120,9 +118,11 @@ def main():
     annotated_image = get_image(tar, image_name, "class")
     image = get_image(tar, image_name)
 
-    #image.show()
-    #annotated_image.show()
+    # image.show()
+    # annotated_image.show()
+
     # --------------------------------------------------------------------------------- #
+
     classes_colors = get_matching_pixels(image, annotated_image)
     print(classes_colors)
 

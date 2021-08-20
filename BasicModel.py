@@ -1,7 +1,7 @@
-from Model import Model  # kinda dumb... name should be changed
+from Model import BaseModel
 
 
-class MRFModel(Model):
+class MRFModel(BaseModel):
     def __init__(self):
         self.beta = 1  # doubleton potential
 

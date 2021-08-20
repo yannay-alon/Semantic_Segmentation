@@ -1,9 +1,12 @@
+import abc
 
 
-class Model:
+class BaseModel:
 
+    @abc.abstractmethod
     def fit(self):
-        raise NotImplementedError
+        raise NotImplementedError("The fit method must be implemented")
 
+    @abc.abstractmethod
     def predict(self):
-        raise NotImplementedError
+        raise NotImplementedError("The predict method must be implemented")
