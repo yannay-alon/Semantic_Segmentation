@@ -4,7 +4,8 @@ import tarfile
 import io
 import re
 import numpy as np
-import BasicModel
+from BasicModel import MRFModel
+from AdvancedModel import DPNModel
 
 VOC_TAR_PATH = "VOCtrainval_11-May-2012"
 
@@ -82,8 +83,7 @@ def get_annotations(tar: tarfile.TarFile, image_name: str) -> List[dict]:
 
 # </editor-fold>
 
-
-def main():
+def voc_images():
     tar = tarfile.open(f"{VOC_TAR_PATH}.tar")
 
     train_file_paths = get_dataset_paths(tar, "train")
@@ -95,20 +95,52 @@ def main():
     annotated_image = get_image(tar, image_name, "class")
     image = get_image(tar, image_name)
 
+
+def mrf():
+    tar = tarfile.open(f"{VOC_TAR_PATH}.tar")
+    train_file_paths = get_dataset_paths(tar, "train")
+
+    image_name = train_file_paths[0]
+
+    annotated_image = get_image(tar, image_name, "class")
+    image = get_image(tar, image_name)
+
     image.show()
     annotated_image.show()
 
     palette = annotated_image.getpalette()
 
-    # --------------------------------------------------------------------------------- #
-
-    MRF = BasicModel.MRFModel(palette)
+    MRF = MRFModel(palette)
     MRF.fit([image], [annotated_image])
     prediction = MRF.predict(image)
 
     predicted_image = Image.fromarray(prediction.astype(np.uint8), mode="P")
     predicted_image.putpalette(palette)
     predicted_image.show()
+
+
+def dpn():
+    tar = tarfile.open(f"{VOC_TAR_PATH}.tar")
+    train_file_paths = get_dataset_paths(tar, "train")
+
+    image_name = train_file_paths[0]
+
+    annotated_image = get_image(tar, image_name, "class")
+    image = get_image(tar, image_name)
+
+    resized_image = image.resize((256, 256))
+    model = DPNModel(*resized_image.size, num_labels=21)
+    output = model.predict(resized_image)
+
+    predicted_image = Image.fromarray(output.detach().int().numpy(), mode="P")
+    predicted_image.putpalette(annotated_image.getpalette())
+    predicted_image.save("predicted.jpg")
+
+    print(output.size())
+
+
+def main():
+    dpn()
 
 
 if __name__ == '__main__':
