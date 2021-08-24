@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Union
 from PIL import Image
 import tarfile
 import io
@@ -11,15 +11,17 @@ VOC_TAR_PATH = "VOCtrainval_11-May-2012"
 
 
 # <editor-fold desc="Read from VOC tar">
-def get_image(tar: tarfile.TarFile, image_name: str, annotations: Optional[str] = None) -> Image.Image:
+def get_images(tar: tarfile.TarFile, image_names: Union[List[str], str],
+               annotations: Optional[str] = None) -> Union[List[Image.Image], Image.Image]:
     """
-    Get the image from the tar
+        Get the image(s) from the tar.\n
+        The images return as a list if image_names is given as a list
 
-    :param tar: The tar file which holds the image
-    :param image_name: The name of the image
-    :param annotations: The type of annotations of the image (either 'class', 'object' or None for unannotated)
-    :return: The image as an object
-    """
+        :param tar: The tar file which holds the image
+        :param image_names: The name or list of names of the image(s)
+        :param annotations: The type of annotations of the image (either 'class', 'object' or None for unannotated)
+        :return: The image as an object or list of images
+        """
     if annotations is None:
         image_directory = "VOCdevkit/VOC2012/JPEGImages"
         suffix = "jpg"
@@ -32,9 +34,16 @@ def get_image(tar: tarfile.TarFile, image_name: str, annotations: Optional[str] 
     else:
         raise ValueError("annotations must be 'class', 'objet' or None")
 
-    image_data = tar.extractfile(f"{image_directory}/{image_name}.{suffix}").read()
-    image = Image.open(io.BytesIO(image_data))
-    return image
+    if isinstance(image_names, str):
+        image_data = tar.extractfile(f"{image_directory}/{image_names}.{suffix}").read()
+        image = Image.open(io.BytesIO(image_data))
+        return image
+
+    images = []
+    for image_name in image_names:
+        image_data = tar.extractfile(f"{image_directory}/{image_name}.{suffix}").read()
+        images.append(Image.open(io.BytesIO(image_data)))
+    return images
 
 
 def get_dataset_paths(tar: tarfile.TarFile, dataset: str) -> List[str]:
@@ -92,8 +101,8 @@ def voc_images():
     image_name = train_file_paths[0]
     annotations = get_annotations(tar, image_name)
 
-    annotated_image = get_image(tar, image_name, "class")
-    image = get_image(tar, image_name)
+    annotated_image = get_images(tar, image_name, "class")
+    image = get_images(tar, image_name)
 
 
 def mrf():
@@ -102,8 +111,8 @@ def mrf():
 
     image_name = train_file_paths[0]
 
-    annotated_image = get_image(tar, image_name, "class")
-    image = get_image(tar, image_name)
+    annotated_image = get_images(tar, image_name, "class")
+    image = get_images(tar, image_name)
 
     image.show()
     annotated_image.show()
@@ -123,20 +132,23 @@ def dpn():
     tar = tarfile.open(f"{VOC_TAR_PATH}.tar")
     train_file_paths = get_dataset_paths(tar, "train")
 
-    image_name = train_file_paths[0]
+    images_names = train_file_paths[:5]
+    images = get_images(tar, images_names)
+    annotated_images = get_images(tar, images_names, annotations="class")
 
-    annotated_image = get_image(tar, image_name, "class")
-    image = get_image(tar, image_name)
+    size = (64, 64)
 
-    resized_image = image.resize((256, 256))
-    model = DPNModel(*resized_image.size, num_labels=21)
-    output = model.predict(resized_image)
+    images = [image.resize(size) for image in images]
+    annotated_images = [image.resize(size) for image in annotated_images]
 
-    predicted_image = Image.fromarray(output.detach().int().numpy(), mode="P")
-    predicted_image.putpalette(annotated_image.getpalette())
-    predicted_image.save("predicted.jpg")
+    model = DPNModel(*size, num_labels=21, palette=annotated_images[0].getpalette())
+    model.fit(images, annotated_images)
 
-    print(output.size())
+    for index, (image, annotated_image) in enumerate(zip(images, annotated_images)):
+        output = model.predict(image)
+        predicted_image = model.prediction_to_image(output)
+        predicted_image.save(f"predicted_{index}.png")
+        # annotated_image.save(f"true_{index}.png")
 
 
 def main():
