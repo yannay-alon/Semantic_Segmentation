@@ -43,7 +43,7 @@ class DPNModel(BaseModel, nn.Module):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-        default_activation_function = nn.ReLU()
+        default_activation_function = nn.LeakyReLU()
 
         # <editor-fold desc="Layers">
 
@@ -146,7 +146,7 @@ class DPNModel(BaseModel, nn.Module):
         return nn.Softmax(dim=1)(output)
 
     def fit(self, images: List[Image.Image], labeled_images: List[Image.Image],
-            epochs: int = 10, learning_rate: float = 1e-3, batch_size: int = 1):
+            epochs: int = 20, learning_rate: float = 1e-4, batch_size: int = 1):
 
         labeled_images = [image.resize(self.image_size) for image in labeled_images]
         self.loss_function = nn.NLLLoss(weight=self._calc_weights(labeled_images), ignore_index=255)
@@ -167,10 +167,8 @@ class DPNModel(BaseModel, nn.Module):
             if REPORT.Loss:
                 epoch_loss = 0
 
-            indices = np.random.permutation(len(images))
-
             start_index = 0
-            while start_index < len(indices):
+            while start_index < len(images):
                 end_index = start_index + batch_size
 
                 images_tensors = []
@@ -191,39 +189,15 @@ class DPNModel(BaseModel, nn.Module):
 
                 loss = self.loss_function(torch.log(predictions), stacked_labels) / batch_size
 
-                if np.isnan(loss.item()):
-                    print("\tLoss is NaN!")
-                    self.cpu()
-                    self.use_cuda = False
-                    return
-
                 loss.backward()
 
                 optimizer.step()
                 self.zero_grad()
 
                 if REPORT.Loss:
-                    epoch_loss += loss.item()
+                    epoch_loss += loss.item() * batch_size
 
                 start_index = end_index
-
-            # for batch_index, image_index in enumerate(indices):
-            #     image, labeled_image = images[image_index], labeled_images[image_index]
-            #     prediction = self.predict(image)
-            #
-            #     labeled_tensor = torch.tensor(np.array(labeled_image), dtype=torch.long,
-            #                                   device="cuda" if self.use_cuda else "cpu")
-            #     labeled_tensor = torch.unsqueeze(labeled_tensor, 0)
-            #
-            #     loss = self.loss_function(prediction, labeled_tensor) / batch_size
-            #     loss.backward()
-            #
-            #     if (batch_index + 1) % batch_size == 0:
-            #         optimizer.step()
-            #         self.zero_grad()
-            #
-            #     if REPORT.Loss:
-            #         epoch_loss += loss.item()
 
             if REPORT.Loss:
                 print(f"\tLoss: {epoch_loss}")
@@ -261,6 +235,8 @@ class DPNModel(BaseModel, nn.Module):
 
         mask = weights > 0
         weights[mask] = 1 / weights[mask]
+        # weights[~mask] = 1
+
         return weights
 
 
