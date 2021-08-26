@@ -138,17 +138,16 @@ def dpn():
 
     size = (64, 64)
 
-    images = [image.resize(size) for image in images]
-    annotated_images = [image.resize(size) for image in annotated_images]
-
     model = DPNModel(*size, num_labels=21, palette=annotated_images[0].getpalette())
     model.fit(images, annotated_images)
 
-    for index, (image, annotated_image) in enumerate(zip(images, annotated_images)):
+    model.save_halfway = True
+    for index, (image, annotated_image) in enumerate(zip(images[:10], annotated_images[:10])):
         output = model.predict(image)
         predicted_image = model.prediction_to_image(output)
-        predicted_image.save(f"predicted_{index}.png")
-        # annotated_image.save(f"true_{index}.png")
+        # image.save(f"Images/base_{index}.jpg")
+        predicted_image.save(f"Images/predicted_{index}.png")
+        # annotated_image.save(f"Images/true_{index}.png")
 
 
 def main():

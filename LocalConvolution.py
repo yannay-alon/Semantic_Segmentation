@@ -1,7 +1,6 @@
 import numpy as np
 import torch
 from torch.nn.parameter import Parameter
-from torch.nn import functional
 import torch.nn as nn
 from itertools import repeat
 from typing import Tuple, Union
@@ -19,10 +18,7 @@ def _n_tuple(n):
     return parse
 
 
-_single = _n_tuple(1)
 _pair = _n_tuple(2)
-_triple = _n_tuple(3)
-_quadruple = _n_tuple(4)
 
 _one_or_more = Union[int, Tuple[int, ...]]
 _one_or_two = Union[int, Tuple[int, int]]
@@ -54,6 +50,13 @@ class Conv2dLocal(nn.Module):
             self.kernel_size[0] * self.kernel_size[1]
         ))
 
+        # height_pos = torch.arange(self.kernel_size[0]).reshape(1, -1)
+        # width_pos = torch.arange(self.kernel_size[1]).reshape(1, -1)
+        # height_distance = (height_pos - height_pos.T) ** 2
+        # width_distance = (width_pos - width_pos.T) ** 2
+        # position_distance = height_distance + width_distance.reshape(in_width, in_width, 1, 1)
+        # self.position_distance_tensor = position_distance.permute(0, 2, 1, 3)
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -63,14 +66,16 @@ class Conv2dLocal(nn.Module):
         stddev = 1 / np.sqrt(n)
         self.weights.data.uniform_(-stddev, stddev)
 
-    def forward(self, input_tensor: torch.Tensor):
+    def forward(self, input_tensor: torch.Tensor, color_distance_tensor: torch.Tensor = None):
+        batch_size = input_tensor.size()[0]
         kernel_height, kernel_width = self.kernel_size
 
         unfolded_data = nn.Unfold(kernel_size=self.kernel_size, padding=self.padding)(input_tensor)
         unfolded_data = unfolded_data.permute(0, 2, 1) \
-            .reshape(1, self.channels, self.out_height * self.out_width, kernel_height * kernel_width)
+            .reshape(batch_size, self.channels, self.out_height * self.out_width, kernel_height * kernel_width)
 
         output = (unfolded_data * self.weights).sum(-1) \
-            .view(1, self.channels, self.out_height, self.out_width)
+            .view(batch_size, self.channels, self.out_height, self.out_width)
+        output = output[:, :, :self.in_height, :self.in_width]
 
-        return output[:, :, :self.in_height, :self.in_width]
+        return output * input_tensor

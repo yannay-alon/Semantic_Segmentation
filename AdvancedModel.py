@@ -6,8 +6,10 @@ from LocalConvolution import Conv2dLocal
 import torch
 from torch.optim import Adam as optimizationFunction
 from torch import Tensor
-import torch.nn as nn
-from typing import List, Dict
+from torchvision import transforms
+from torch import nn
+from torch.nn import functional
+from typing import List
 from PIL import Image
 from collections import namedtuple
 
@@ -35,112 +37,79 @@ class DPNModel(BaseModel, nn.Module):
                  num_labels: int = 21, num_mixture_filters: int = 5, palette=None):
         super(DPNModel, self).__init__()
 
+        self.preprocess = transforms.Compose([
+            transforms.Resize(size=(image_height, image_width)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        default_activation_function = nn.ReLU()
+
         # <editor-fold desc="Layers">
 
+        # (repetitions, out_channels, kernel, dilation, padding)
+        architecture = [(2, 64, 3, 1, 1), "M", (2, 128, 3, 1, 1), "M", (3, 256, 3, 1, 1), "M",
+                        (3, 512, 3, 1, 1), (3, 512, 3, 2, 2),
+                        (1, 4096, 7, 4, 12), (1, num_labels, 1, 1, 0)]
+
+        layers = []
+        in_channels = 3
+        for step in architecture:
+            if isinstance(step, tuple):
+                repetitions, out_channels, kernel, dilation, padding = step
+                for _ in range(repetitions):
+                    layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
+                                         kernel_size=(kernel, kernel), dilation=(dilation, dilation),
+                                         padding=(padding, padding), stride=(1, 1)),
+                               default_activation_function]
+                    in_channels = out_channels
+            elif isinstance(step, str):
+                layers += [nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))]
+
         self.unary_terms_layers = nn.Sequential(
-            # 1
-            nn.Conv2d(in_channels=3, out_channels=64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
-            nn.ReLU(),
-
-            # 2
-            nn.MaxPool2d(kernel_size=2, stride=2),
-
-            # 3
-            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=128, out_channels=128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
-            nn.ReLU(),
-
-            # 4
-            nn.MaxPool2d(kernel_size=2, stride=2),
-
-            # 5
-            nn.Conv2d(in_channels=128, out_channels=256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=256, out_channels=256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=256, out_channels=256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
-            nn.ReLU(),
-
-            # 6
-            nn.MaxPool2d(kernel_size=2, stride=2),
-
-            # 7
-            nn.Conv2d(in_channels=256, out_channels=512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
-            nn.ReLU(),
-
-            # 8
-            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=(3, 3), stride=(1, 1),
-                      dilation=(2, 2), padding=(2, 2)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=(3, 3), stride=(1, 1),
-                      dilation=(2, 2), padding=(2, 2)),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=(3, 3), stride=(1, 1),
-                      dilation=(2, 2), padding=(2, 2)),
-            nn.ReLU(),
-
-            # 9
-            nn.Conv2d(in_channels=512, out_channels=4096, kernel_size=(7, 7), stride=(1, 1),
-                      dilation=(4, 4), padding=(12, 12)),
-            nn.ReLU(),
-
-            # 10
-            nn.Conv2d(in_channels=4096, out_channels=4096, kernel_size=(1, 1), stride=(1, 1)),
-            nn.ReLU(),
-
-            # 11
-            nn.Conv2d(in_channels=4096, out_channels=num_labels, kernel_size=(1, 1), stride=(1, 1)),
+            *layers,
             nn.UpsamplingBilinear2d(size=(image_height, image_width)),
             nn.Sigmoid(),
         )
 
-        # 12 - Local convolutional
         self.local_convolution_layer = Conv2dLocal(in_height=image_height, in_width=image_width, channels=num_labels,
-                                                   kernel_size=(50, 50), stride=(1, 1), padding=(25, 25))
+                                                   kernel_size=(50, 50), padding=(25, 25))
         self.local_activation_function = nn.Linear(in_features=num_labels, out_features=num_labels)
 
         # 13
         self.global_convolution_layer = nn.Conv2d(in_channels=num_labels, out_channels=num_labels * num_mixture_filters,
-                                                  kernel_size=(9, 9), stride=(1, 1), padding=(4, 4))
+                                                  kernel_size=(9, 9), padding=(4, 4))
         self.global_activation_function = nn.Linear(in_features=num_labels * num_mixture_filters,
                                                     out_features=num_labels * num_mixture_filters)
 
-        self.pooling = nn.Sequential(
-            # 14 - Block min pooling
-            BlockMinPooling(kernel_size=num_mixture_filters, stride=1, dim=1),
-
-            # 15 - Sum pooling (same as average with divisor=1)
-            nn.AvgPool2d(kernel_size=1, stride=1, divisor_override=1),
-            nn.Softmax(dim=1)
-        )
+        # 14 - Block min block_pooling
+        self.block_pooling = BlockMinPooling(kernel_size=num_mixture_filters, stride=1, dim=1)
 
         # </editor-fold>
 
         self.reset_parameters()
 
+        self.num_labels = num_labels
+        self.image_size = (image_height, image_width)
         self.color_palette = palette
 
-        weights = torch.tensor([1] + [10] * 20, dtype=torch.float)
-        self.loss_function = nn.CrossEntropyLoss(weight=weights, ignore_index=255)
+        self.loss_function = nn.NLLLoss(ignore_index=255)
         self.use_cuda = False
+
+        self.count = 0
+        self.save_halfway = False
 
     def reset_parameters(self):
         def random_parameters(model: nn.Module):
             if isinstance(model, (nn.Conv2d, nn.Linear)):
-                model.weight.data.normal_(0.0, 0.1)
-                model.bias.data.fill_(0)
+                model.weight.data.normal_(0, 0.01)
+                model.bias.data.fill_(0.01)
 
-        # self.apply(random_parameters)
+        self.apply(random_parameters)
 
         pretrained_vgg = vgg16(pretrained=True)
         pretrained_vgg.train()
+
         relevant_vgg_parameters_indices = [index for index, layer in enumerate(pretrained_vgg.features)
                                            if isinstance(layer, nn.Conv2d)]
         relevant_dpn_parameters_indices = [index for index, layer in enumerate(self.unary_terms_layers)
@@ -152,22 +121,35 @@ class DPNModel(BaseModel, nn.Module):
             # self.unary_terms_layers[p_i].requires_grad_(False)
 
     def forward(self, input_tensor: Tensor) -> Tensor:
+
         if self.use_cuda:
             input_tensor = input_tensor.to(device="cuda")
-        intermediate_output = self.unary_terms_layers(input_tensor)
+        unary_output = self.unary_terms_layers(input_tensor)
 
-        intermediate_output = self.local_convolution_layer(intermediate_output).permute(0, 2, 3, 1)
+        if self.save_halfway:
+            halfway_prediction = self.prediction_to_image(unary_output)
+            halfway_prediction.save(f"Images/halfway_prediction_{self.count}.png")
+            self.count += 1
+
+        # return unary_output
+
+        intermediate_output = self.local_convolution_layer(unary_output).permute(0, 2, 3, 1)
         intermediate_output = self.local_activation_function(intermediate_output).permute(0, 3, 1, 2)
 
         intermediate_output = self.global_convolution_layer(intermediate_output).permute(0, 2, 3, 1)
         intermediate_output = self.global_activation_function(intermediate_output).permute(0, 3, 1, 2)
 
-        output = self.pooling(intermediate_output)
+        smoothness_output = self.block_pooling(intermediate_output)
 
-        return output
+        output = torch.log(unary_output) - smoothness_output
+
+        return nn.Softmax(dim=1)(output)
 
     def fit(self, images: List[Image.Image], labeled_images: List[Image.Image],
-            epochs: int = 10, learning_rate: float = 1e-2, batch_size: int = 5):
+            epochs: int = 10, learning_rate: float = 1e-3, batch_size: int = 1):
+
+        labeled_images = [image.resize(self.image_size) for image in labeled_images]
+        self.loss_function = nn.NLLLoss(weight=self._calc_weights(labeled_images), ignore_index=255)
 
         self.use_cuda = torch.cuda.is_available()
         if self.use_cuda:
@@ -185,22 +167,63 @@ class DPNModel(BaseModel, nn.Module):
             if REPORT.Loss:
                 epoch_loss = 0
 
-            for index, (image, labeled_image) in enumerate(zip(images, labeled_images)):
-                prediction = self.predict(image)
+            indices = np.random.permutation(len(images))
 
-                labeled_tensor = torch.tensor(np.array(labeled_image), dtype=torch.long,
-                                              device="cuda" if self.use_cuda else "cpu")
-                labeled_tensor = torch.unsqueeze(labeled_tensor, 0)
+            start_index = 0
+            while start_index < len(indices):
+                end_index = start_index + batch_size
 
-                loss = self.loss_function(prediction, labeled_tensor) / batch_size
+                images_tensors = []
+                labels_tensors = []
+                batch_images = images[start_index: end_index]
+                batch_labels = labeled_images[start_index: end_index]
+                for image, labeled_image in zip(batch_images, batch_labels):
+                    images_tensors.append(self.preprocess(image))
+                    labels_tensors.append(torch.tensor(np.array(labeled_image), dtype=torch.long))
+
+                stacked_images = torch.stack(images_tensors)
+                stacked_labels = torch.stack(labels_tensors)
+
+                stacked_images = stacked_images.to(device="cuda" if self.use_cuda else "cpu")
+                stacked_labels = stacked_labels.to(device="cuda" if self.use_cuda else "cpu")
+
+                predictions = self.forward(stacked_images)
+
+                loss = self.loss_function(torch.log(predictions), stacked_labels) / batch_size
+
+                if np.isnan(loss.item()):
+                    print("\tLoss is NaN!")
+                    self.cpu()
+                    self.use_cuda = False
+                    return
+
                 loss.backward()
+
+                optimizer.step()
+                self.zero_grad()
 
                 if REPORT.Loss:
                     epoch_loss += loss.item()
 
-                if (index + 1) % batch_size == 0:
-                    optimizer.step()
-                    self.zero_grad()
+                start_index = end_index
+
+            # for batch_index, image_index in enumerate(indices):
+            #     image, labeled_image = images[image_index], labeled_images[image_index]
+            #     prediction = self.predict(image)
+            #
+            #     labeled_tensor = torch.tensor(np.array(labeled_image), dtype=torch.long,
+            #                                   device="cuda" if self.use_cuda else "cpu")
+            #     labeled_tensor = torch.unsqueeze(labeled_tensor, 0)
+            #
+            #     loss = self.loss_function(prediction, labeled_tensor) / batch_size
+            #     loss.backward()
+            #
+            #     if (batch_index + 1) % batch_size == 0:
+            #         optimizer.step()
+            #         self.zero_grad()
+            #
+            #     if REPORT.Loss:
+            #         epoch_loss += loss.item()
 
             if REPORT.Loss:
                 print(f"\tLoss: {epoch_loss}")
@@ -213,8 +236,7 @@ class DPNModel(BaseModel, nn.Module):
         self.use_cuda = False
 
     def predict(self, image: Image.Image) -> Tensor:
-        tensor = torch.tensor(np.array(image), dtype=torch.float)
-        tensor = tensor.permute(2, 0, 1)
+        tensor = self.preprocess(image)
         tensor = torch.unsqueeze(tensor, 0)
 
         output = self.forward(tensor)
@@ -228,6 +250,18 @@ class DPNModel(BaseModel, nn.Module):
         image = Image.fromarray(labeled.numpy(), mode="P")
         image.putpalette(self.color_palette)
         return image
+
+    def _calc_weights(self, labeled_images: List[Image.Image]) -> Tensor:
+        weights = torch.zeros(self.num_labels)
+        for image in labeled_images:
+            values, counts = np.unique(np.array(image), return_counts=True)
+            for value, count in zip(values, counts):
+                if value < self.num_labels:
+                    weights[value] += count
+
+        mask = weights > 0
+        weights[mask] = 1 / weights[mask]
+        return weights
 
 
 def test():
