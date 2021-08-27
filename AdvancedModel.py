@@ -9,7 +9,7 @@ from torch import Tensor
 from torchvision import transforms
 from torch import nn
 from torch.nn import functional
-from typing import List
+from typing import List, Union, Tuple
 from PIL import Image
 from collections import namedtuple
 
@@ -72,6 +72,8 @@ class DPNModel(BaseModel, nn.Module):
             nn.Sigmoid(),
         )
 
+        # 12
+        self.color_distance_calculator = DPNModel._color_distance_wrapper(channels=3, kernel_size=(50, 50))
         self.local_convolution_layer = Conv2dLocal(in_height=image_height, in_width=image_width, channels=num_labels,
                                                    kernel_size=(50, 50), padding=(25, 25))
         self.local_activation_function = nn.Linear(in_features=num_labels, out_features=num_labels)
@@ -133,7 +135,11 @@ class DPNModel(BaseModel, nn.Module):
 
         # return unary_output
 
-        intermediate_output = self.local_convolution_layer(unary_output).permute(0, 2, 3, 1)
+        color_weight_tensor = self.color_distance_calculator(input_tensor)
+        if self.use_cuda:
+            color_weight_tensor = color_weight_tensor.to(device="cuda")
+
+        intermediate_output = self.local_convolution_layer(unary_output, color_weight_tensor).permute(0, 2, 3, 1)
         intermediate_output = self.local_activation_function(intermediate_output).permute(0, 3, 1, 2)
 
         intermediate_output = self.global_convolution_layer(intermediate_output).permute(0, 2, 3, 1)
@@ -146,7 +152,7 @@ class DPNModel(BaseModel, nn.Module):
         return nn.Softmax(dim=1)(output)
 
     def fit(self, images: List[Image.Image], labeled_images: List[Image.Image],
-            epochs: int = 20, learning_rate: float = 1e-4, batch_size: int = 1):
+            epochs: int = 50, learning_rate: float = 1e-4, batch_size: int = 1):
 
         labeled_images = [image.resize(self.image_size) for image in labeled_images]
         self.loss_function = nn.NLLLoss(weight=self._calc_weights(labeled_images), ignore_index=255)
@@ -157,6 +163,9 @@ class DPNModel(BaseModel, nn.Module):
         print(f"Using cuda: {self.use_cuda}")
 
         optimizer = optimizationFunction(self.parameters(), lr=learning_rate)
+
+        if REPORT.Time:
+            start_time = time.time()
 
         for epoch in range(epochs):
 
@@ -200,11 +209,15 @@ class DPNModel(BaseModel, nn.Module):
                 start_index = end_index
 
             if REPORT.Loss:
-                print(f"\tLoss: {epoch_loss}")
+                print(f"\tLoss: {epoch_loss:.3f}")
 
             if REPORT.Time:
                 end_epoch_time = time.time()
-                print(f"EPOCH TIME: {end_epoch_time - start_epoch_time}")
+                print(f"EPOCH TIME: {end_epoch_time - start_epoch_time:.3f} sec")
+
+        if REPORT.Time:
+            end_time = time.time()
+            print(f"TOTAL TIME: {end_time - start_time:.3f} sec")
 
         self.cpu()
         self.use_cuda = False
@@ -238,6 +251,58 @@ class DPNModel(BaseModel, nn.Module):
         # weights[~mask] = 1
 
         return weights
+
+    def calc_intersection_over_union(self, prediction: Union[torch.LongTensor, Image.Image],
+                                     target: Union[torch.LongTensor, Image.Image],
+                                     include_background: bool = False) -> torch.LongTensor:
+
+        if isinstance(prediction, Image.Image):
+            prediction = torch.tensor(np.array(prediction.resize(self.image_size)), dtype=torch.long)
+        if isinstance(target, Image.Image):
+            target = torch.tensor(np.array(target.resize(self.image_size)), dtype=torch.long)
+
+        start = 0 if include_background else 1
+        intersection_over_union_tensor = torch.zeros(self.num_labels, dtype=torch.long)
+        for label in range(start, self.num_labels):
+            prediction_indicator = prediction == label
+            target_indicator = target == label
+
+            intersection = prediction_indicator[target_indicator].sum().item()
+            union = prediction_indicator.sum().item() + target_indicator.sum().item() - intersection
+
+            if intersection == 0:
+                intersection_over_union_tensor[label] = 0
+            elif union == 0:
+                intersection_over_union_tensor[label] = -1
+            else:
+                intersection_over_union_tensor[label] = intersection / union
+
+        return intersection_over_union_tensor
+
+    @staticmethod
+    def _calc_color_distance(image_tensor: Tensor, channels: int,
+                             kernel_size: Tuple[int, int]) -> Tensor:
+        k1, k2 = kernel_size
+
+        top_padding, bottom_padding = k1 // 2, (k1 - 1) // 2
+        left_padding, right_padding = k2 // 2, (k2 - 1) // 2
+
+        padded = functional.pad(image_tensor,
+                                pad=(top_padding, bottom_padding, left_padding, right_padding),
+                                mode="constant", value=0)
+        unfolded = torch.nn.Unfold(kernel_size=kernel_size)(padded) \
+            .reshape(1, channels, k1 * k2, -1).permute(0, 1, 3, 2)
+        distances = torch.pow(image_tensor.view(1, channels, -1, 1) - unfolded, 2).sum(dim=1)
+
+        return distances
+
+    @staticmethod
+    def _color_distance_wrapper(channels: int, kernel_size: Tuple[int, int]):
+        def wrapped_function(image_tensor: Tensor):
+            return DPNModel._calc_color_distance(image_tensor, channels=channels,
+                                                 kernel_size=kernel_size)
+
+        return wrapped_function
 
 
 def test():

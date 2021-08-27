@@ -129,10 +129,13 @@ def mrf():
 
 
 def dpn():
+    num_images = 5
+    num_images_to_display = num_images
+
     tar = tarfile.open(f"{VOC_TAR_PATH}.tar")
     train_file_paths = get_dataset_paths(tar, "train")
 
-    images_names = train_file_paths[:5]
+    images_names = train_file_paths[:num_images]
     images = get_images(tar, images_names)
     annotated_images = get_images(tar, images_names, annotations="class")
 
@@ -142,12 +145,13 @@ def dpn():
     model.fit(images, annotated_images)
 
     model.save_halfway = True
-    for index, (image, annotated_image) in enumerate(zip(images[:10], annotated_images[:10])):
+    for index, (image, annotated_image) in enumerate(zip(images[:num_images_to_display],
+                                                         annotated_images[:num_images_to_display])):
         output = model.predict(image)
         predicted_image = model.prediction_to_image(output)
-        # image.save(f"Images/base_{index}.jpg")
+        image.save(f"Images/base_{index}.jpg")
         predicted_image.save(f"Images/predicted_{index}.png")
-        # annotated_image.save(f"Images/true_{index}.png")
+        annotated_image.save(f"Images/true_{index}.png")
 
 
 def main():

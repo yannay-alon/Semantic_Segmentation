@@ -1,7 +1,8 @@
 import numpy as np
 import torch
 from torch.nn.parameter import Parameter
-import torch.nn as nn
+from torch import nn
+from torch.nn import functional
 from itertools import repeat
 from typing import Tuple, Union
 
@@ -42,40 +43,41 @@ class Conv2dLocal(nn.Module):
         self.in_height = in_height
         self.in_width = in_width
 
-        self.out_height = in_height + 2 * self.padding[0] - self.kernel_size[0] + 1
-        self.out_width = in_width + 2 * self.padding[1] - self.kernel_size[1] + 1
+        self.color_weight = Parameter(torch.zeros(1, dtype=torch.float))
+        self.position_weight = Parameter(torch.zeros(1, dtype=torch.float))
 
-        self.weights = Parameter(torch.Tensor(
-            self.out_height * self.out_width,
-            self.kernel_size[0] * self.kernel_size[1]
-        ))
+        height_pos = torch.arange(self.kernel_size[0]).reshape(1, -1)
+        width_pos = torch.arange(self.kernel_size[1]).reshape(1, -1)
+        height_distance = (height_pos - self.kernel_size[0] // 2) ** 2
+        width_distance = (width_pos - self.kernel_size[1] // 2) ** 2
+        position_distances_tensor = (height_distance + width_distance.T).reshape(-1)
 
-        # height_pos = torch.arange(self.kernel_size[0]).reshape(1, -1)
-        # width_pos = torch.arange(self.kernel_size[1]).reshape(1, -1)
-        # height_distance = (height_pos - height_pos.T) ** 2
-        # width_distance = (width_pos - width_pos.T) ** 2
-        # position_distance = height_distance + width_distance.reshape(in_width, in_width, 1, 1)
-        # self.position_distance_tensor = position_distance.permute(0, 2, 1, 3)
+        self.register_buffer("position_distances", position_distances_tensor)
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        n = self.channels
-        for k in self.kernel_size:
-            n *= k
-        stddev = 1 / np.sqrt(n)
-        self.weights.data.uniform_(-stddev, stddev)
+        self.position_weight.data = torch.tensor(0.01, dtype=torch.float)
+        self.color_weight.data = torch.tensor(0.01, dtype=torch.float)
 
-    def forward(self, input_tensor: torch.Tensor, color_distance_tensor: torch.Tensor = None):
+    def forward(self, input_tensor: torch.Tensor, color_distance_tensor: torch.Tensor = 0):
         batch_size = input_tensor.size()[0]
         kernel_height, kernel_width = self.kernel_size
 
-        unfolded_data = nn.Unfold(kernel_size=self.kernel_size, padding=self.padding)(input_tensor)
-        unfolded_data = unfolded_data.permute(0, 2, 1) \
-            .reshape(batch_size, self.channels, self.out_height * self.out_width, kernel_height * kernel_width)
+        top_padding, bottom_padding = kernel_height // 2, (kernel_height - 1) // 2
+        left_padding, right_padding = kernel_width // 2, (kernel_width - 1) // 2
 
-        output = (unfolded_data * self.weights).sum(-1) \
-            .view(batch_size, self.channels, self.out_height, self.out_width)
-        output = output[:, :, :self.in_height, :self.in_width]
+        padded = functional.pad(input_tensor,
+                                pad=(top_padding, bottom_padding, left_padding, right_padding),
+                                mode="constant", value=0)
+
+        unfolded_data = nn.Unfold(kernel_size=self.kernel_size)(padded)
+        unfolded_data = unfolded_data.permute(0, 2, 1) \
+            .reshape(batch_size, self.channels, kernel_height * kernel_width, -1).permute(0, 1, 3, 2)
+
+        weights = self.position_distances * self.position_weight + color_distance_tensor * self.color_weight
+
+        output = (unfolded_data * weights).sum(-1) \
+            .view(batch_size, self.channels, self.in_height, self.in_width)
 
         return output * input_tensor
