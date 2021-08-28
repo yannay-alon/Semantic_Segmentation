@@ -13,6 +13,8 @@ from typing import List, Union, Tuple
 from PIL import Image
 from collections import namedtuple
 
+import sys
+
 REPORT_CONSTANTS = namedtuple("REPORT", ["Loss", "Time"])
 REPORT = REPORT_CONSTANTS(Loss=True, Time=True)
 
@@ -47,17 +49,31 @@ class DPNModel(BaseModel, nn.Module):
 
         # <editor-fold desc="Layers">
 
-        # (repetitions, out_channels, kernel, dilation, padding)
-        architecture = [(2, 64, 3, 1, 1), "M", (2, 128, 3, 1, 1), "M", (3, 256, 3, 1, 1), "M",
-                        (3, 512, 3, 1, 1), (3, 512, 3, 2, 2),
-                        (1, 4096, 7, 4, 12), (1, num_labels, 1, 1, 0)]
+        # The architecture of the first 11 groups
+        # Each group consist of a convolution or pooling
+        # A convolution is described by a tuple: (repetitions, out_channels, kernel, dilation, padding)
+        #   repetitions: Number of repeated layers
+        #   out_channels: The number of channels after this group
+        #   kernel: The size of the kernel (assuming square kernel)
+        #   dilation: The dilation step (assuming equal in each dimension)
+        #   padding: The padding for the layer (assuming equal in each dimension)
+        # A pooling is described with a string: "M" for MaxPooling
+        architecture = [(2, 64, 3, 1, 1), "M",
+                        (2, 128, 3, 1, 1), "M",
+                        (3, 256, 3, 1, 1), "M",
+                        (3, 512, 3, 1, 1),
+                        (3, 512, 3, 2, 2),
+                        (1, 4096, 7, 4, 12),
+                        (1, 4096, 1, 1, 1),
+                        (1, num_labels, 1, 1, 0)]
 
         layers = []
-        in_channels = 3
+        in_channels = 3  # Initial number of channels (for RGB images)
         for step in architecture:
             if isinstance(step, tuple):
                 repetitions, out_channels, kernel, dilation, padding = step
                 for _ in range(repetitions):
+                    # Each convolution layer followed by an activation function
                     layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
                                          kernel_size=(kernel, kernel), dilation=(dilation, dilation),
                                          padding=(padding, padding), stride=(1, 1)),
@@ -66,30 +82,31 @@ class DPNModel(BaseModel, nn.Module):
             elif isinstance(step, str):
                 layers += [nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))]
 
+        # Groups 1 - 11
         self.unary_terms_layers = nn.Sequential(
             *layers,
-            nn.UpsamplingBilinear2d(size=(image_height, image_width)),
+            nn.UpsamplingBilinear2d(size=(image_height, image_width)),  # Up-sample to the original size
             nn.Sigmoid(),
         )
 
-        # 12
+        # Group 12 - Local convolution
         self.color_distance_calculator = DPNModel._color_distance_wrapper(channels=3, kernel_size=(50, 50))
         self.local_convolution_layer = Conv2dLocal(in_height=image_height, in_width=image_width, channels=num_labels,
                                                    kernel_size=(50, 50), padding=(25, 25))
         self.local_activation_function = nn.Linear(in_features=num_labels, out_features=num_labels)
 
-        # 13
+        # Group 13
         self.global_convolution_layer = nn.Conv2d(in_channels=num_labels, out_channels=num_labels * num_mixture_filters,
                                                   kernel_size=(9, 9), padding=(4, 4))
         self.global_activation_function = nn.Linear(in_features=num_labels * num_mixture_filters,
                                                     out_features=num_labels * num_mixture_filters)
 
-        # 14 - Block min block_pooling
+        # Group 14 - Block min block_pooling
         self.block_pooling = BlockMinPooling(kernel_size=num_mixture_filters, stride=1, dim=1)
 
         # </editor-fold>
 
-        self.reset_parameters()
+        self.reset_parameters()  # Initialize the parameters of the model
 
         self.num_labels = num_labels
         self.image_size = (image_height, image_width)
@@ -98,17 +115,15 @@ class DPNModel(BaseModel, nn.Module):
         self.loss_function = nn.NLLLoss(ignore_index=255)
         self.use_cuda = False
 
-        self.count = 0
-        self.save_halfway = False
-
     def reset_parameters(self):
         def random_parameters(model: nn.Module):
             if isinstance(model, (nn.Conv2d, nn.Linear)):
                 model.weight.data.normal_(0, 0.01)
                 model.bias.data.fill_(0.01)
 
-        self.apply(random_parameters)
+        self.apply(random_parameters)  # Initialize the parameters randomly
 
+        # Use the pretrained VGG-16 model for the first
         pretrained_vgg = vgg16(pretrained=True)
         pretrained_vgg.train()
 
@@ -120,7 +135,6 @@ class DPNModel(BaseModel, nn.Module):
         for p_i, v_i in zip(relevant_dpn_parameters_indices, relevant_vgg_parameters_indices):
             self.unary_terms_layers[p_i].weight.data = pretrained_vgg.features[v_i].weight.data
             self.unary_terms_layers[p_i].bias.data = pretrained_vgg.features[v_i].bias.data
-            # self.unary_terms_layers[p_i].requires_grad_(False)
 
     def forward(self, input_tensor: Tensor) -> Tensor:
 
@@ -128,18 +142,12 @@ class DPNModel(BaseModel, nn.Module):
             input_tensor = input_tensor.to(device="cuda")
         unary_output = self.unary_terms_layers(input_tensor)
 
-        if self.save_halfway:
-            halfway_prediction = self.prediction_to_image(unary_output)
-            halfway_prediction.save(f"Images/halfway_prediction_{self.count}.png")
-            self.count += 1
-
-        # return unary_output
-
-        color_weight_tensor = self.color_distance_calculator(input_tensor)
+        # Calculate the color distance tensor
+        color_distance_tensor = self.color_distance_calculator(input_tensor)
         if self.use_cuda:
-            color_weight_tensor = color_weight_tensor.to(device="cuda")
+            color_distance_tensor = color_distance_tensor.to(device="cuda")
 
-        intermediate_output = self.local_convolution_layer(unary_output, color_weight_tensor).permute(0, 2, 3, 1)
+        intermediate_output = self.local_convolution_layer(unary_output, color_distance_tensor).permute(0, 2, 3, 1)
         intermediate_output = self.local_activation_function(intermediate_output).permute(0, 3, 1, 2)
 
         intermediate_output = self.global_convolution_layer(intermediate_output).permute(0, 2, 3, 1)
@@ -152,8 +160,9 @@ class DPNModel(BaseModel, nn.Module):
         return nn.Softmax(dim=1)(output)
 
     def fit(self, images: List[Image.Image], labeled_images: List[Image.Image],
-            epochs: int = 50, learning_rate: float = 1e-4, batch_size: int = 1):
+            epochs: int = 80, learning_rate: float = 1e-4, batch_size: int = 1):
 
+        # Resize the annotated images and calculate the weight for the classes
         labeled_images = [image.resize(self.image_size) for image in labeled_images]
         self.loss_function = nn.NLLLoss(weight=self._calc_weights(labeled_images), ignore_index=255)
 
@@ -248,7 +257,6 @@ class DPNModel(BaseModel, nn.Module):
 
         mask = weights > 0
         weights[mask] = 1 / weights[mask]
-        # weights[~mask] = 1
 
         return weights
 
@@ -280,27 +288,21 @@ class DPNModel(BaseModel, nn.Module):
         return intersection_over_union_tensor
 
     @staticmethod
-    def _calc_color_distance(image_tensor: Tensor, channels: int,
-                             kernel_size: Tuple[int, int]) -> Tensor:
-        k1, k2 = kernel_size
-
-        top_padding, bottom_padding = k1 // 2, (k1 - 1) // 2
-        left_padding, right_padding = k2 // 2, (k2 - 1) // 2
-
-        padded = functional.pad(image_tensor,
-                                pad=(top_padding, bottom_padding, left_padding, right_padding),
-                                mode="constant", value=0)
-        unfolded = torch.nn.Unfold(kernel_size=kernel_size)(padded) \
-            .reshape(1, channels, k1 * k2, -1).permute(0, 1, 3, 2)
-        distances = torch.pow(image_tensor.view(1, channels, -1, 1) - unfolded, 2).sum(dim=1)
-
-        return distances
-
-    @staticmethod
     def _color_distance_wrapper(channels: int, kernel_size: Tuple[int, int]):
         def wrapped_function(image_tensor: Tensor):
-            return DPNModel._calc_color_distance(image_tensor, channels=channels,
-                                                 kernel_size=kernel_size)
+            k1, k2 = kernel_size
+
+            top_padding, bottom_padding = k1 // 2, (k1 - 1) // 2
+            left_padding, right_padding = k2 // 2, (k2 - 1) // 2
+
+            padded = functional.pad(image_tensor,
+                                    pad=(top_padding, bottom_padding, left_padding, right_padding),
+                                    mode="constant", value=0)
+            unfolded = torch.nn.Unfold(kernel_size=kernel_size)(padded) \
+                .reshape(1, channels, k1 * k2, -1).permute(0, 1, 3, 2)
+            distances = torch.pow(image_tensor.view(1, channels, -1, 1) - unfolded, 2).sum(dim=1)
+
+            return distances
 
         return wrapped_function
 
