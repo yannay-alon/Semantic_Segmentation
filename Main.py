@@ -1,9 +1,11 @@
-from typing import List, Optional, Union
-from PIL import Image
-import tarfile
 import io
 import re
+import torch
+import tarfile
 import numpy as np
+from PIL import Image
+from typing import List, Optional, Union
+
 from BasicModel import MRFModel
 from AdvancedModel import DPNModel
 
@@ -129,29 +131,41 @@ def mrf():
 
 
 def dpn():
-    num_images = 5
+    Train = True
+    Test = True
+
+    num_images = 10
     num_images_to_display = num_images
 
     tar = tarfile.open(f"{VOC_TAR_PATH}.tar")
     train_file_paths = get_dataset_paths(tar, "train")
+    validation_file_paths = get_dataset_paths(tar, "val")
 
-    images_names = train_file_paths[:num_images]
-    images = get_images(tar, images_names)
-    annotated_images = get_images(tar, images_names, annotations="class")
+    train_images_names = train_file_paths[:num_images]
+    train_images = get_images(tar, train_images_names)
+    train_annotated_images = get_images(tar, train_images_names, annotations="class")
 
     size = (64, 64)
 
-    model = DPNModel(*size, num_labels=21, palette=annotated_images[0].getpalette())
-    model.fit(images, annotated_images)
+    model = DPNModel(*size, num_labels=21, palette=train_annotated_images[0].getpalette())
 
-    model.save_halfway = True
-    for index, (image, annotated_image) in enumerate(zip(images[:num_images_to_display],
-                                                         annotated_images[:num_images_to_display])):
-        output = model.predict(image)
-        predicted_image = model.prediction_to_image(output)
-        image.save(f"Images/base_{index}.jpg")
-        predicted_image.save(f"Images/predicted_{index}.png")
-        annotated_image.save(f"Images/true_{index}.png")
+    weight_path = "weights.pt"
+
+    if Train:
+        model.fit(train_images, train_annotated_images, weight_path=weight_path)
+    else:
+        model.load_state_dict(torch.load(weight_path), strict=False)
+
+    if Test:
+        with torch.no_grad():
+            for index, (image, annotated_image) in enumerate(zip(train_images[:num_images_to_display],
+                                                                 train_annotated_images[:num_images_to_display])):
+                output = model.predict(image)
+                predicted_image = model.prediction_to_image(output)
+                predicted_image.save(f"Images/predicted_{index}.png")
+                annotated_image.save(f"Images/annotated_{index}.png")
+                print(f"Image {index}: "
+                      f"mIoU = {model.calc_mean_intersection_over_union(predicted_image, annotated_image):.3f}")
 
 
 def main():

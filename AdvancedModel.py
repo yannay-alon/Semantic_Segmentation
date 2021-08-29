@@ -1,31 +1,30 @@
-import time
-import numpy as np
-from torchvision.models import vgg16
 from Model import BaseModel
 from LocalConvolution import Conv2dLocal
-import torch
-from torch.optim import Adam as optimizationFunction
-from torch import Tensor
-from torchvision import transforms
-from torch import nn
-from torch.nn import functional
-from typing import List, Union, Tuple
-from PIL import Image
-from collections import namedtuple
 
-import sys
+import torch
+from torch import nn
+from torch import Tensor
+from torch.nn import functional
+from torch.optim import Adam as optimizationFunction
+from torchvision import transforms
+from torchvision.models import vgg16
+
+import time
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+from collections import namedtuple
+from typing import List, Union, Tuple, Optional, Callable
 
 REPORT_CONSTANTS = namedtuple("REPORT", ["Loss", "Time"])
 REPORT = REPORT_CONSTANTS(Loss=True, Time=True)
 
 
 class BlockMinPooling(nn.Module):
-    # REMARK: Only implemented for 1D kernel and stride=1
-    def __init__(self, kernel_size: int, stride: int, dim: int = 1):
+    def __init__(self, kernel_size: int, dim: int = 1):
         super(BlockMinPooling, self).__init__()
 
         self.kernel_size = kernel_size
-        self.stride = stride
         self.dim = dim
 
     def forward(self, input_tensor: Tensor) -> Tensor:
@@ -36,51 +35,55 @@ class BlockMinPooling(nn.Module):
 
 class DPNModel(BaseModel, nn.Module):
     def __init__(self, image_height: int, image_width: int,
-                 num_labels: int = 21, num_mixture_filters: int = 5, palette=None):
+                 num_labels: int = 21, num_mixture_filters: int = 10, palette=None):
         super(DPNModel, self).__init__()
 
-        self.preprocess = transforms.Compose([
-            transforms.Resize(size=(image_height, image_width)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        self.preprocess = self._preprocess(image_height, image_width)
 
-        default_activation_function = nn.LeakyReLU()
+        default_activation_function = nn.ReLU()
 
-        # <editor-fold desc="Layers">
+        # <editor-fold desc="Unary Term Layers">
 
         # The architecture of the first 11 groups
-        # Each group consist of a convolution or pooling
-        # A convolution is described by a tuple: (repetitions, out_channels, kernel, dilation, padding)
+        # Each group consist of a convolution or pooling, decided by the first letter (C or M)
+        #
+        # A convolution is described by: ("C", repetitions, out_channels, kernel, dilation, padding, stride)
         #   repetitions: Number of repeated layers
         #   out_channels: The number of channels after this group
-        #   kernel: The size of the kernel (assuming square kernel)
-        #   dilation: The dilation step (assuming equal in each dimension)
-        #   padding: The padding for the layer (assuming equal in each dimension)
-        # A pooling is described with a string: "M" for MaxPooling
-        architecture = [(2, 64, 3, 1, 1), "M",
-                        (2, 128, 3, 1, 1), "M",
-                        (3, 256, 3, 1, 1), "M",
-                        (3, 512, 3, 1, 1),
-                        (3, 512, 3, 2, 2),
-                        (1, 4096, 7, 4, 12),
-                        (1, 4096, 1, 1, 1),
-                        (1, num_labels, 1, 1, 0)]
+        #   kernel: The size of the kernel
+        #   dilation: The dilation step
+        #   padding: The padding for the layer
+        #   stride: The stride of the kernel
+        #
+        # A pooling is described by: ("M", kernel, stride)
+        #   kernel: The size of the kernel
+        #   stride: The stride of the kernel
+        architecture = [("C", 2, 64, 3, 1, 1, 1), ("M", 2, 2),
+                        ("C", 2, 128, 3, 1, 1, 1), ("M", 2, 2),
+                        ("C", 3, 256, 3, 1, 1, 1), ("M", 2, 2),
+                        ("C", 3, 512, 3, 1, 1, 1),
+                        ("C", 3, 512, 3, 2, 2, 1),
+                        ("C", 1, 4096, 7, 4, 12, 1),
+                        ("C", 1, 4096, 1, 1, 1, 1),
+                        ("C", 1, num_labels, 1, 1, 0, 1)]
 
         layers = []
         in_channels = 3  # Initial number of channels (for RGB images)
         for step in architecture:
-            if isinstance(step, tuple):
-                repetitions, out_channels, kernel, dilation, padding = step
+            letter, *arguments = step
+            if letter == "C":
+                repetitions, out_channels, kernel, dilation, padding, stride = arguments
                 for _ in range(repetitions):
                     # Each convolution layer followed by an activation function
                     layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
                                          kernel_size=(kernel, kernel), dilation=(dilation, dilation),
-                                         padding=(padding, padding), stride=(1, 1)),
+                                         padding=(padding, padding), stride=(stride, stride)),
+                               nn.BatchNorm2d(num_features=out_channels, affine=False),
                                default_activation_function]
                     in_channels = out_channels
-            elif isinstance(step, str):
-                layers += [nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))]
+            elif letter == "M":
+                kernel, stride = arguments
+                layers += [nn.MaxPool2d(kernel_size=(kernel, kernel), stride=(stride, stride))]
 
         # Groups 1 - 11
         self.unary_terms_layers = nn.Sequential(
@@ -90,9 +93,9 @@ class DPNModel(BaseModel, nn.Module):
         )
 
         # Group 12 - Local convolution
-        self.color_distance_calculator = DPNModel._color_distance_wrapper(channels=3, kernel_size=(50, 50))
-        self.local_convolution_layer = Conv2dLocal(in_height=image_height, in_width=image_width, channels=num_labels,
-                                                   kernel_size=(50, 50), padding=(25, 25))
+        self.color_distance_calculator = DPNModel._color_distance(channels=3, kernel_size=(50, 50))
+        self.local_convolution_layer = Conv2dLocal(in_height=image_height, in_width=image_width,
+                                                   channels=num_labels, kernel_size=(50, 50))
         self.local_activation_function = nn.Linear(in_features=num_labels, out_features=num_labels)
 
         # Group 13
@@ -102,11 +105,12 @@ class DPNModel(BaseModel, nn.Module):
                                                     out_features=num_labels * num_mixture_filters)
 
         # Group 14 - Block min block_pooling
-        self.block_pooling = BlockMinPooling(kernel_size=num_mixture_filters, stride=1, dim=1)
+        self.block_pooling = BlockMinPooling(kernel_size=num_mixture_filters, dim=1)
 
         # </editor-fold>
 
-        self.reset_parameters()  # Initialize the parameters of the model
+        # Initialize the parameters of the model
+        self.reset_parameters()
 
         self.num_labels = num_labels
         self.image_size = (image_height, image_width)
@@ -115,7 +119,13 @@ class DPNModel(BaseModel, nn.Module):
         self.loss_function = nn.NLLLoss(ignore_index=255)
         self.use_cuda = False
 
-    def reset_parameters(self):
+    def reset_parameters(self, use_vgg: bool = True):
+        """
+        Reset the parameters of the model
+
+        :param use_vgg: Whether or not use the pretrained vgg model
+        """
+
         def random_parameters(model: nn.Module):
             if isinstance(model, (nn.Conv2d, nn.Linear)):
                 model.weight.data.normal_(0, 0.01)
@@ -123,23 +133,27 @@ class DPNModel(BaseModel, nn.Module):
 
         self.apply(random_parameters)  # Initialize the parameters randomly
 
-        # Use the pretrained VGG-16 model for the first
-        pretrained_vgg = vgg16(pretrained=True)
-        pretrained_vgg.train()
+        if use_vgg:
+            # Use the pretrained VGG-16 model for the first
+            pretrained_vgg = vgg16(pretrained=True)
+            pretrained_vgg.train()
 
-        relevant_vgg_parameters_indices = [index for index, layer in enumerate(pretrained_vgg.features)
-                                           if isinstance(layer, nn.Conv2d)]
-        relevant_dpn_parameters_indices = [index for index, layer in enumerate(self.unary_terms_layers)
-                                           if isinstance(layer, nn.Conv2d)]
+            relevant_vgg_parameters_indices = [index for index, layer in enumerate(pretrained_vgg.features)
+                                               if isinstance(layer, nn.Conv2d)]
+            relevant_dpn_parameters_indices = [index for index, layer in enumerate(self.unary_terms_layers)
+                                               if isinstance(layer, nn.Conv2d)]
 
-        for p_i, v_i in zip(relevant_dpn_parameters_indices, relevant_vgg_parameters_indices):
-            self.unary_terms_layers[p_i].weight.data = pretrained_vgg.features[v_i].weight.data
-            self.unary_terms_layers[p_i].bias.data = pretrained_vgg.features[v_i].bias.data
+            for p_i, v_i in zip(relevant_dpn_parameters_indices, relevant_vgg_parameters_indices):
+                self.unary_terms_layers[p_i].weight.data = pretrained_vgg.features[v_i].weight.data
+                self.unary_terms_layers[p_i].bias.data = pretrained_vgg.features[v_i].bias.data
 
     def forward(self, input_tensor: Tensor) -> Tensor:
+        """
+        Calculate the forward pass through the model layers
 
-        if self.use_cuda:
-            input_tensor = input_tensor.to(device="cuda")
+        :param input_tensor: The input for the pass
+        :return: The result of the pass
+        """
         unary_output = self.unary_terms_layers(input_tensor)
 
         # Calculate the color distance tensor
@@ -160,12 +174,23 @@ class DPNModel(BaseModel, nn.Module):
         return nn.Softmax(dim=1)(output)
 
     def fit(self, images: List[Image.Image], labeled_images: List[Image.Image],
-            epochs: int = 80, learning_rate: float = 1e-4, batch_size: int = 1):
+            epochs: int = 80, learning_rate: float = 1e-5, batch_size: int = 1, weight_path: Optional[str] = None):
+        """
+        Train the model on the given images
+
+        :param images: The RGB images for the training
+        :param labeled_images: The annotated images as ground-truth
+        :param epochs: The number of epochs to train
+        :param learning_rate: The rate for the optimizer
+        :param batch_size: The size of each batch in the training process
+        :param weight_path: The path where the weights will be saved
+        """
 
         # Resize the annotated images and calculate the weight for the classes
         labeled_images = [image.resize(self.image_size) for image in labeled_images]
         self.loss_function = nn.NLLLoss(weight=self._calc_weights(labeled_images), ignore_index=255)
 
+        # Move the model to the GPU if possible
         self.use_cuda = torch.cuda.is_available()
         if self.use_cuda:
             self.cuda()
@@ -173,73 +198,127 @@ class DPNModel(BaseModel, nn.Module):
 
         optimizer = optimizationFunction(self.parameters(), lr=learning_rate)
 
-        if REPORT.Time:
+        if REPORT.Loss:
+            loss_list = []
+
+        if REPORT.Time or True:
             start_time = time.time()
 
         for epoch in range(epochs):
+
+            if REPORT.Loss:
+                epoch_loss = 0
 
             if REPORT.Time:
                 start_epoch_time = time.time()
                 print(f"START EPOCH: {epoch}")
 
-            if REPORT.Loss:
-                epoch_loss = 0
+            # <editor-fold desc="Real batches (requires more memory)"
 
-            start_index = 0
-            while start_index < len(images):
-                end_index = start_index + batch_size
+            # start_index = 0
+            # while start_index < len(images):
+            #     end_index = start_index + batch_size
+            #
+            #     images_tensors = []
+            #     labels_tensors = []
+            #     batch_images = images[start_index: end_index]
+            #     batch_labels = labeled_images[start_index: end_index]
+            #     for image, labeled_image in zip(batch_images, batch_labels):
+            #         images_tensors.append(self.preprocess(image))
+            #         labels_tensors.append(torch.tensor(np.array(labeled_image), dtype=torch.long))
+            #
+            #     stacked_images = torch.stack(images_tensors)
+            #     stacked_labels = torch.stack(labels_tensors)
+            #
+            #     if self.use_cuda:
+            #         stacked_images = stacked_images.to(device="cuda")
+            #         stacked_labels = stacked_labels.to(device="cuda")
+            #
+            #     predictions = self.forward(stacked_images)
+            #
+            #     loss = self.loss_function(torch.log(predictions), stacked_labels) / batch_size
+            #
+            #     loss.backward()
+            #
+            #     optimizer.step()
+            #     self.zero_grad()
+            #
+            #     if REPORT.Loss:
+            #         epoch_loss += loss * batch_size
+            #
+            #     start_index = end_index
 
-                images_tensors = []
-                labels_tensors = []
-                batch_images = images[start_index: end_index]
-                batch_labels = labeled_images[start_index: end_index]
-                for image, labeled_image in zip(batch_images, batch_labels):
-                    images_tensors.append(self.preprocess(image))
-                    labels_tensors.append(torch.tensor(np.array(labeled_image), dtype=torch.long))
+            # </editor-fold>
 
-                stacked_images = torch.stack(images_tensors)
-                stacked_labels = torch.stack(labels_tensors)
+            for batch_index, (image, labeled_image) in enumerate(zip(images, labeled_images)):
+                # Transform the image and labeled_image into tensors
+                image_tensor = self.preprocess(image)
+                labels_tensor = torch.unsqueeze(torch.tensor(np.array(labeled_image), dtype=torch.long), dim=0)
 
-                stacked_images = stacked_images.to(device="cuda" if self.use_cuda else "cpu")
-                stacked_labels = stacked_labels.to(device="cuda" if self.use_cuda else "cpu")
+                # Move to cuda if possible
+                if self.use_cuda:
+                    image_tensor = image_tensor.to(device="cuda")
+                    labels_tensor = labels_tensor.to(device="cuda")
 
-                predictions = self.forward(stacked_images)
+                prediction = self.forward(image_tensor)
 
-                loss = self.loss_function(torch.log(predictions), stacked_labels) / batch_size
-
+                loss = self.loss_function(torch.log(prediction), labels_tensor) / batch_size
                 loss.backward()
 
-                optimizer.step()
-                self.zero_grad()
+                if (batch_index + 1) % batch_size == 0:
+                    optimizer.step()
+                    self.zero_grad()
 
                 if REPORT.Loss:
-                    epoch_loss += loss.item() * batch_size
-
-                start_index = end_index
+                    epoch_loss += loss * batch_size
 
             if REPORT.Loss:
-                print(f"\tLoss: {epoch_loss:.3f}")
+                loss_list.append(epoch_loss)
+                print(f"\tLoss: {epoch_loss}")
 
             if REPORT.Time:
                 end_epoch_time = time.time()
                 print(f"EPOCH TIME: {end_epoch_time - start_epoch_time:.3f} sec")
 
-        if REPORT.Time:
+        if REPORT.Time or True:
             end_time = time.time()
             print(f"TOTAL TIME: {end_time - start_time:.3f} sec")
 
+        if REPORT.Loss:
+            plt.plot(loss_list)
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("Loss v.s. Epochs")
+            plt.savefig("Loss_vs_Epochs.png")
+
+        # Remove the model from the GPU
         self.cpu()
         self.use_cuda = False
 
+        # Save the model weights (if requested)
+        if weight_path is not None:
+            torch.save(self.state_dict(), weight_path)
+
     def predict(self, image: Image.Image) -> Tensor:
+        """
+        Get the prediction for the given image
+
+        :param image: The image to predict the annotations for
+        :return: A probability tensor, for each pixel there is a probability vector over the labels
+        """
         tensor = self.preprocess(image)
-        tensor = torch.unsqueeze(tensor, 0)
 
         output = self.forward(tensor)
 
         return output
 
     def prediction_to_image(self, prediction: Tensor) -> Image.Image:
+        """
+        Translate a probability tensor into an image
+
+        :param prediction: The probability tensor (usually the output of predict or forward)
+        :return: The image predicted as the most likely
+        """
         prediction = torch.squeeze(prediction, 0)
         labeled = torch.argmax(prediction, dim=0).type(torch.uint8)
 
@@ -247,7 +326,86 @@ class DPNModel(BaseModel, nn.Module):
         image.putpalette(self.color_palette)
         return image
 
+    def calc_mean_intersection_over_union(self, prediction: Union[torch.LongTensor, Image.Image],
+                                          target: Union[torch.LongTensor, Image.Image],
+                                          include_background: bool = False) -> float:
+        """
+
+        :param prediction:
+        :param target:
+        :param include_background:
+        :return:
+        """
+        iou = self.calc_intersection_over_union(prediction, target, include_background)
+
+        mask = iou > 0
+        num_relevant_labels = torch.sum(mask)
+
+        if num_relevant_labels == 0:
+            return 0
+
+        mean = torch.sum(iou[mask]) / num_relevant_labels
+        return mean.item()
+
+    def calc_intersection_over_union(self, prediction: Union[torch.LongTensor, Image.Image],
+                                     target: Union[torch.LongTensor, Image.Image],
+                                     include_background: bool = False) -> torch.LongTensor:
+        """
+        Calculate the IoU (Intersection over Union) for the given prediction and target
+
+        :param prediction: The prediction (not as a probability tensor)
+        :param target: The target image to compare the prediction
+        :param include_background: Whether or not the background should be included in the calculations
+        :return: The IoU for each class.<br>
+                In case the class does not appear in either the prediction nor the target, the value will be negative
+        """
+
+        # Transform the prediction and the target to tensors if necessary
+        if isinstance(prediction, Image.Image):
+            prediction = torch.tensor(np.array(prediction.resize(self.image_size)), dtype=torch.long)
+        if isinstance(target, Image.Image):
+            target = torch.tensor(np.array(target.resize(self.image_size)), dtype=torch.long)
+
+        prediction = torch.flatten(prediction)
+        target = torch.flatten(target)
+
+        start = 0 if include_background else 1
+        intersection_over_union_tensor = torch.zeros(self.num_labels, dtype=torch.float)
+        for label in range(start, self.num_labels):
+            prediction_indicator = prediction == label
+            target_indicator = target == label
+
+            intersection = prediction_indicator[target_indicator].sum().item()
+            union = prediction_indicator.sum().item() + target_indicator.sum().item() - intersection
+
+            if union == 0:
+                # The IoU is not defined (represents as a negative number)
+                intersection_over_union_tensor[label] = -1
+            else:
+                intersection_over_union_tensor[label] = intersection / union
+
+        return intersection_over_union_tensor
+
+    @staticmethod
+    def _preprocess(image_height: int, image_width: int) -> Callable[[Image.Image], Tensor]:
+        transformation = transforms.Compose([
+            transforms.Resize(size=(image_height, image_width)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        def wrapped_preprocess(image: Image.Image) -> Tensor:
+            return torch.unsqueeze(transformation(image), dim=0)
+
+        return wrapped_preprocess
+
     def _calc_weights(self, labeled_images: List[Image.Image]) -> Tensor:
+        """
+        Calculate the weights for the loss function, in order to deal with unbalanced classes
+
+        :param labeled_images: A list of annotated images to calculate the bias over
+        :return: A tensor of weights to counteract the bias
+        """
         weights = torch.zeros(self.num_labels)
         for image in labeled_images:
             values, counts = np.unique(np.array(image), return_counts=True)
@@ -260,36 +418,24 @@ class DPNModel(BaseModel, nn.Module):
 
         return weights
 
-    def calc_intersection_over_union(self, prediction: Union[torch.LongTensor, Image.Image],
-                                     target: Union[torch.LongTensor, Image.Image],
-                                     include_background: bool = False) -> torch.LongTensor:
-
-        if isinstance(prediction, Image.Image):
-            prediction = torch.tensor(np.array(prediction.resize(self.image_size)), dtype=torch.long)
-        if isinstance(target, Image.Image):
-            target = torch.tensor(np.array(target.resize(self.image_size)), dtype=torch.long)
-
-        start = 0 if include_background else 1
-        intersection_over_union_tensor = torch.zeros(self.num_labels, dtype=torch.long)
-        for label in range(start, self.num_labels):
-            prediction_indicator = prediction == label
-            target_indicator = target == label
-
-            intersection = prediction_indicator[target_indicator].sum().item()
-            union = prediction_indicator.sum().item() + target_indicator.sum().item() - intersection
-
-            if intersection == 0:
-                intersection_over_union_tensor[label] = 0
-            elif union == 0:
-                intersection_over_union_tensor[label] = -1
-            else:
-                intersection_over_union_tensor[label] = intersection / union
-
-        return intersection_over_union_tensor
-
     @staticmethod
-    def _color_distance_wrapper(channels: int, kernel_size: Tuple[int, int]):
-        def wrapped_function(image_tensor: Tensor):
+    def _color_distance(kernel_size: Tuple[int, int], channels: int = 3) -> Callable[[Image.Image], Tensor]:
+        """
+        Get a function to calculate the color distance tensor
+
+        :param kernel_size: The size of the kernel's receptive field
+        :param channels: The number of channels in the image
+        :return: A function to calculate the color distance tensor
+        """
+
+        def wrapped_color_distance(image_tensor: Tensor) -> Tensor:
+            """
+            Calculate the color distance tensor
+
+            :param image_tensor: The tensor to calculate over
+            :return: The color distance of the given tensor
+            """
+            batch_size = image_tensor.size()[0]
             k1, k2 = kernel_size
 
             top_padding, bottom_padding = k1 // 2, (k1 - 1) // 2
@@ -299,38 +445,9 @@ class DPNModel(BaseModel, nn.Module):
                                     pad=(top_padding, bottom_padding, left_padding, right_padding),
                                     mode="constant", value=0)
             unfolded = torch.nn.Unfold(kernel_size=kernel_size)(padded) \
-                .reshape(1, channels, k1 * k2, -1).permute(0, 1, 3, 2)
-            distances = torch.pow(image_tensor.view(1, channels, -1, 1) - unfolded, 2).sum(dim=1)
+                .reshape(batch_size, channels, k1 * k2, -1).permute(0, 1, 3, 2)
+            distances = torch.pow(image_tensor.view(batch_size, channels, -1, 1) - unfolded, 2).sum(dim=1)
 
             return distances
 
-        return wrapped_function
-
-
-def test():
-    tensor = torch.tensor([
-        [
-            [0, 1, -1, -2, 1, 2],
-            [2, 3, -3, -4, 3, 4],
-            [4, 5, -5, -6, 5, 6],
-            [-4, -5, 5, 6, -5, -6]
-        ],
-        [
-            [6, 7, -7, -8, 7, 8],
-            [8, 9, -9, -10, 9, 10],
-            [10, 11, -11, -12, 11, 12],
-            [-10, -11, 11, 12, -11, -12]
-        ],
-        [
-            [12, 13, -13, -14, 13, 14],
-            [14, 15, -15, -16, 15, 16],
-            [16, 17, -17, -18, 17, 18],
-            [-16, -17, 17, 18, -17, -18]
-        ]
-    ])
-
-    print(f"Tensor shape: {tensor}")
-
-
-if __name__ == '__main__':
-    test()
+        return wrapped_color_distance
