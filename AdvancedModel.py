@@ -34,16 +34,19 @@ class BlockMinPooling(nn.Module):
 
 
 class DPNModel(BaseModel, nn.Module):
+    NUM_PHASES: int = 4
+
     def __init__(self, image_height: int, image_width: int,
                  num_labels: int = 21, num_mixture_filters: int = 10, palette=None):
         super(DPNModel, self).__init__()
 
         self.preprocess = self._preprocess(image_height, image_width)
 
-        default_activation_function = nn.ReLU()
+        activation_function = nn.ReLU()
 
-        # <editor-fold desc="Unary Term Layers">
+        # <editor-fold desc="Model Layers">
 
+        # <editor-fold desc="Unary Term Architecture">
         # The architecture of the first 11 groups
         # Each group consist of a convolution or pooling, decided by the first letter (C or M)
         #
@@ -79,11 +82,13 @@ class DPNModel(BaseModel, nn.Module):
                                          kernel_size=(kernel, kernel), dilation=(dilation, dilation),
                                          padding=(padding, padding), stride=(stride, stride)),
                                nn.BatchNorm2d(num_features=out_channels, affine=False),
-                               default_activation_function]
+                               activation_function]
                     in_channels = out_channels
             elif letter == "M":
                 kernel, stride = arguments
                 layers += [nn.MaxPool2d(kernel_size=(kernel, kernel), stride=(stride, stride))]
+
+        # </editor-fold>
 
         # Groups 1 - 11
         self.unary_terms_layers = nn.Sequential(
@@ -147,34 +152,51 @@ class DPNModel(BaseModel, nn.Module):
                 self.unary_terms_layers[p_i].weight.data = pretrained_vgg.features[v_i].weight.data
                 self.unary_terms_layers[p_i].bias.data = pretrained_vgg.features[v_i].bias.data
 
-    def forward(self, input_tensor: Tensor) -> Tensor:
+    def forward(self, input_tensor: Tensor, phase: int = NUM_PHASES) -> Tensor:
         """
         Calculate the forward pass through the model layers
 
         :param input_tensor: The input for the pass
+        :param phase: For training purposes - incremental learning. phase should be between 1 and 4 (included)
         :return: The result of the pass
         """
+
+        final_activation_function = nn.LogSoftmax(dim=1)
+
+        # Phase 1 (Groups 1 to 11)
         unary_output = self.unary_terms_layers(input_tensor)
+
+        if phase == 1:
+            return final_activation_function(unary_output)
 
         # Calculate the color distance tensor
         color_distance_tensor = self.color_distance_calculator(input_tensor)
         if self.use_cuda:
             color_distance_tensor = color_distance_tensor.to(device="cuda")
 
+        # Phase 2 (Adding group 12)
         intermediate_output = self.local_convolution_layer(unary_output, color_distance_tensor).permute(0, 2, 3, 1)
         intermediate_output = self.local_activation_function(intermediate_output).permute(0, 3, 1, 2)
 
+        if phase == 2:
+            return final_activation_function(intermediate_output)
+
+        # Phase 3 (Adding groups 13 and 14)
         intermediate_output = self.global_convolution_layer(intermediate_output).permute(0, 2, 3, 1)
         intermediate_output = self.global_activation_function(intermediate_output).permute(0, 3, 1, 2)
-
         smoothness_output = self.block_pooling(intermediate_output)
 
+        if phase == 3:
+            return final_activation_function(smoothness_output)
+
+        # Phase 4 (Adding group 15 - Full)
         output = torch.log(unary_output) - smoothness_output
 
-        return nn.Softmax(dim=1)(output)
+        return final_activation_function(output)
 
     def fit(self, images: List[Image.Image], labeled_images: List[Image.Image],
-            epochs: int = 80, learning_rate: float = 1e-5, batch_size: int = 1, weight_path: Optional[str] = None):
+            epochs: int = 80, learning_rate: float = 1e-5, batch_size: int = 1,
+            weight_path: Optional[str] = None, incremental: bool = True):
         """
         Train the model on the given images
 
@@ -184,11 +206,77 @@ class DPNModel(BaseModel, nn.Module):
         :param learning_rate: The rate for the optimizer
         :param batch_size: The size of each batch in the training process
         :param weight_path: The path where the weights will be saved
+        :param incremental:
         """
 
         # Resize the annotated images and calculate the weight for the classes
         labeled_images = [image.resize(self.image_size) for image in labeled_images]
         self.loss_function = nn.NLLLoss(weight=self._calc_weights(labeled_images), ignore_index=255)
+
+        def fit_single_phase(phase: int = self.NUM_PHASES):
+            """
+            Fit for a single phase\n
+            (training only for phase=4 is the same as non incremental learning)
+
+            :param phase: The phase of the training
+            """
+            if REPORT.Loss:
+                loss_list = []
+
+            if REPORT.Time:
+                print(f"START PHASE {phase}")
+                start_time = time.time()
+
+            for epoch in range(epochs):
+
+                if REPORT.Loss:
+                    epoch_loss = 0
+
+                if REPORT.Time:
+                    start_epoch_time = time.time()
+                    print(f"\tSTART EPOCH: {epoch}")
+
+                for batch_index, (image, labeled_image) in enumerate(zip(images, labeled_images)):
+                    # Transform the image and labeled_image into tensors
+                    image_tensor = self.preprocess(image)
+                    labels_tensor = torch.unsqueeze(torch.tensor(np.array(labeled_image), dtype=torch.long), dim=0)
+
+                    # Move to cuda if possible
+                    if self.use_cuda:
+                        image_tensor = image_tensor.to(device="cuda")
+                        labels_tensor = labels_tensor.to(device="cuda")
+
+                    prediction = self.forward(image_tensor, phase=phase)
+
+                    loss = self.loss_function(prediction, labels_tensor) / batch_size
+                    loss.backward()
+
+                    if (batch_index + 1) % batch_size == 0:
+                        optimizer.step()
+                        self.zero_grad()
+
+                    if REPORT.Loss:
+                        epoch_loss += loss * batch_size
+
+                if REPORT.Loss:
+                    loss_list.append(epoch_loss)
+                    print(f"\t\tLoss: {epoch_loss:.3f}")
+
+                if REPORT.Time:
+                    end_epoch_time = time.time()
+                    print(f"\tEPOCH TIME: {end_epoch_time - start_epoch_time:.3f} sec")
+
+            if REPORT.Time:
+                end_time = time.time()
+                print(f"TOTAL PHASE TIME: {end_time - start_time:.3f} sec")
+
+            if REPORT.Loss:
+                plt.plot(loss_list)
+                plt.xlabel("Epoch")
+                plt.ylabel("Loss")
+                plt.title(f"Loss v.s. Epochs in phase {phase}")
+                plt.savefig(f"Loss_vs_Epochs_phase_{phase}.png")
+                plt.cla()
 
         # Move the model to the GPU if possible
         self.use_cuda = torch.cuda.is_available()
@@ -198,98 +286,24 @@ class DPNModel(BaseModel, nn.Module):
 
         optimizer = optimizationFunction(self.parameters(), lr=learning_rate)
 
-        if REPORT.Loss:
-            loss_list = []
+        if incremental:
+            for phase_index in range(self.NUM_PHASES):
+                # Freeze the trained layers
+                if phase_index == 0:
+                    pass
+                if phase_index == 1:
+                    self.unary_terms_layers.requires_grad_(False)
+                if phase_index == 2:
+                    self.local_convolution_layer.requires_grad_(False)
+                    self.local_activation_function.requires_grad_(False)
+                if phase_index == 3:
+                    self.unary_terms_layers.requires_grad_(True)
+                    self.local_convolution_layer.requires_grad_(True)
+                    self.local_activation_function.requires_grad_(True)
 
-        if REPORT.Time or True:
-            start_time = time.time()
-
-        for epoch in range(epochs):
-
-            if REPORT.Loss:
-                epoch_loss = 0
-
-            if REPORT.Time:
-                start_epoch_time = time.time()
-                print(f"START EPOCH: {epoch}")
-
-            # <editor-fold desc="Real batches (requires more memory)"
-
-            # start_index = 0
-            # while start_index < len(images):
-            #     end_index = start_index + batch_size
-            #
-            #     images_tensors = []
-            #     labels_tensors = []
-            #     batch_images = images[start_index: end_index]
-            #     batch_labels = labeled_images[start_index: end_index]
-            #     for image, labeled_image in zip(batch_images, batch_labels):
-            #         images_tensors.append(self.preprocess(image))
-            #         labels_tensors.append(torch.tensor(np.array(labeled_image), dtype=torch.long))
-            #
-            #     stacked_images = torch.stack(images_tensors)
-            #     stacked_labels = torch.stack(labels_tensors)
-            #
-            #     if self.use_cuda:
-            #         stacked_images = stacked_images.to(device="cuda")
-            #         stacked_labels = stacked_labels.to(device="cuda")
-            #
-            #     predictions = self.forward(stacked_images)
-            #
-            #     loss = self.loss_function(torch.log(predictions), stacked_labels) / batch_size
-            #
-            #     loss.backward()
-            #
-            #     optimizer.step()
-            #     self.zero_grad()
-            #
-            #     if REPORT.Loss:
-            #         epoch_loss += loss * batch_size
-            #
-            #     start_index = end_index
-
-            # </editor-fold>
-
-            for batch_index, (image, labeled_image) in enumerate(zip(images, labeled_images)):
-                # Transform the image and labeled_image into tensors
-                image_tensor = self.preprocess(image)
-                labels_tensor = torch.unsqueeze(torch.tensor(np.array(labeled_image), dtype=torch.long), dim=0)
-
-                # Move to cuda if possible
-                if self.use_cuda:
-                    image_tensor = image_tensor.to(device="cuda")
-                    labels_tensor = labels_tensor.to(device="cuda")
-
-                prediction = self.forward(image_tensor)
-
-                loss = self.loss_function(torch.log(prediction), labels_tensor) / batch_size
-                loss.backward()
-
-                if (batch_index + 1) % batch_size == 0:
-                    optimizer.step()
-                    self.zero_grad()
-
-                if REPORT.Loss:
-                    epoch_loss += loss * batch_size
-
-            if REPORT.Loss:
-                loss_list.append(epoch_loss)
-                print(f"\tLoss: {epoch_loss}")
-
-            if REPORT.Time:
-                end_epoch_time = time.time()
-                print(f"EPOCH TIME: {end_epoch_time - start_epoch_time:.3f} sec")
-
-        if REPORT.Time or True:
-            end_time = time.time()
-            print(f"TOTAL TIME: {end_time - start_time:.3f} sec")
-
-        if REPORT.Loss:
-            plt.plot(loss_list)
-            plt.xlabel("Epoch")
-            plt.ylabel("Loss")
-            plt.title("Loss v.s. Epochs")
-            plt.savefig("Loss_vs_Epochs.png")
+                fit_single_phase(phase=phase_index + 1)
+        else:
+            fit_single_phase()
 
         # Remove the model from the GPU
         self.cpu()

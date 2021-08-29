@@ -152,7 +152,7 @@ def dpn():
     weight_path = "weights.pt"
 
     if Train:
-        model.fit(train_images, train_annotated_images, weight_path=weight_path)
+        model.fit(train_images, train_annotated_images, weight_path=weight_path, incremental=False)
     else:
         model.load_state_dict(torch.load(weight_path), strict=False)
 
