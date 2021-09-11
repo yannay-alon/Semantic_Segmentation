@@ -19,6 +19,8 @@ from typing import List, Union, Tuple, Optional, Callable
 REPORT_CONSTANTS = namedtuple("REPORT", ["Loss", "Time"])
 REPORT = REPORT_CONSTANTS(Loss=True, Time=True)
 
+SAVE_CHECKPOINT = False
+
 
 class BlockMinPooling(nn.Module):
     def __init__(self, kernel_size: int, dim: int = 1):
@@ -33,11 +35,32 @@ class BlockMinPooling(nn.Module):
         return torch.min(tensors, dim=self.dim).values
 
 
+class LinearActivation(nn.Module):
+    def __init__(self, num_channels: int, height: int, width: int, bias: bool = True):
+        super(LinearActivation, self).__init__()
+        self.weight = nn.Parameter(torch.empty(1, num_channels, height, width))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(1, num_channels, height, width))
+        else:
+            self.bias = None
+
+    def reset_parameters(self):
+        nn.init.xavier_normal_(self.weight.data)
+        if self.bias is not None:
+            nn.init.xavier_normal_(self.bias.data)
+
+    def forward(self, input_tensor: Tensor) -> Tensor:
+        output = self.weight * input_tensor
+        if self.bias is not None:
+            return output + self.bias
+        return output
+
+
 class DPNModel(BaseModel, nn.Module):
     NUM_PHASES: int = 4
 
     def __init__(self, image_height: int, image_width: int,
-                 num_labels: int = 21, num_mixture_filters: int = 10, palette=None):
+                 num_labels: int = 21, num_mixture_filters: int = 5, palette=None):
         super(DPNModel, self).__init__()
 
         self.preprocess = self._preprocess(image_height, image_width)
@@ -61,13 +84,24 @@ class DPNModel(BaseModel, nn.Module):
         # A pooling is described by: ("M", kernel, stride)
         #   kernel: The size of the kernel
         #   stride: The stride of the kernel
+
+        # Original architecture
         architecture = [("C", 2, 64, 3, 1, 1, 1), ("M", 2, 2),
                         ("C", 2, 128, 3, 1, 1, 1), ("M", 2, 2),
                         ("C", 3, 256, 3, 1, 1, 1), ("M", 2, 2),
                         ("C", 3, 512, 3, 1, 1, 1),
                         ("C", 3, 512, 3, 2, 2, 1),
                         ("C", 1, 4096, 7, 4, 12, 1),
-                        ("C", 1, 4096, 1, 1, 1, 1),
+                        ("C", 1, 4096, 1, 1, 0, 1),
+                        ("C", 1, num_labels, 1, 1, 0, 1)]
+
+        architecture = [("C", 2, 64, 7, 1, 3, 1), ("M", 2, 2),
+                        ("C", 2, 128, 5, 1, 2, 1), ("M", 2, 2),
+                        ("C", 3, 256, 5, 1, 2, 1),  # ("M", 2, 2),
+                        ("C", 3, 512, 3, 1, 1, 1),
+                        ("C", 3, 512, 3, 2, 2, 1),
+                        ("C", 1, 4096, 7, 4, 12, 1),
+                        ("C", 1, 4096, 1, 1, 0, 1),
                         ("C", 1, num_labels, 1, 1, 0, 1)]
 
         layers = []
@@ -76,48 +110,54 @@ class DPNModel(BaseModel, nn.Module):
             letter, *arguments = step
             if letter == "C":
                 repetitions, out_channels, kernel, dilation, padding, stride = arguments
-                for _ in range(repetitions):
+                for index in range(repetitions):
                     # Each convolution layer followed by an activation function
                     layers += [nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
                                          kernel_size=(kernel, kernel), dilation=(dilation, dilation),
-                                         padding=(padding, padding), stride=(stride, stride)),
-                               nn.BatchNorm2d(num_features=out_channels, affine=False),
-                               activation_function]
+                                         padding=(padding, padding), stride=(stride, stride))]
+                    if index < repetitions - 1:
+                        layers += [activation_function]
                     in_channels = out_channels
             elif letter == "M":
                 kernel, stride = arguments
                 layers += [nn.MaxPool2d(kernel_size=(kernel, kernel), stride=(stride, stride))]
 
-        # </editor-fold>
-
         # Groups 1 - 11
         self.unary_terms_layers = nn.Sequential(
             *layers,
             nn.UpsamplingBilinear2d(size=(image_height, image_width)),  # Up-sample to the original size
-            nn.Sigmoid(),
+            # nn.Sigmoid()
         )
+
+        # </editor-fold>
 
         # Group 12 - Local convolution
         self.color_distance_calculator = DPNModel._color_distance(channels=3, kernel_size=(50, 50))
         self.local_convolution_layer = Conv2dLocal(in_height=image_height, in_width=image_width,
                                                    channels=num_labels, kernel_size=(50, 50))
-        self.local_activation_function = nn.Linear(in_features=num_labels, out_features=num_labels)
+        self.local_activation_function = LinearActivation(num_labels, image_height, image_width)
+        # self.local_activation_function = nn.Linear(in_features=num_labels, out_features=num_labels)
 
         # Group 13
-        self.global_convolution_layer = nn.Conv2d(in_channels=num_labels, out_channels=num_labels * num_mixture_filters,
+        temporal_channels = num_labels * num_mixture_filters
+        self.global_convolution_layer = nn.Conv2d(in_channels=num_labels, out_channels=temporal_channels,
                                                   kernel_size=(9, 9), padding=(4, 4))
-        self.global_activation_function = nn.Linear(in_features=num_labels * num_mixture_filters,
-                                                    out_features=num_labels * num_mixture_filters)
+        self.global_activation_function = LinearActivation(temporal_channels, image_height, image_width)
+        # self.global_activation_function = nn.Linear(in_features=num_labels * num_mixture_filters,
+        #                                             out_features=num_labels * num_mixture_filters)
 
         # Group 14 - Block min block_pooling
         self.block_pooling = BlockMinPooling(kernel_size=num_mixture_filters, dim=1)
 
+        self.final_activation_function = nn.LogSoftmax(dim=1)
+
         # </editor-fold>
 
         # Initialize the parameters of the model
-        self.reset_parameters()
+        self.reset_parameters(use_vgg=False)
 
         self.num_labels = num_labels
+        self.num_mixture_filters = num_mixture_filters
         self.image_size = (image_height, image_width)
         self.color_palette = palette
 
@@ -133,10 +173,13 @@ class DPNModel(BaseModel, nn.Module):
 
         def random_parameters(model: nn.Module):
             if isinstance(model, (nn.Conv2d, nn.Linear)):
-                model.weight.data.normal_(0, 0.01)
-                model.bias.data.fill_(0.01)
+                model.weight.data.normal_(0, 1 / torch.numel(model.weight.data) ** 0.5)
+                model.bias.data.normal_(0, 1 / torch.numel(model.bias.data) ** 0.5)
 
         self.apply(random_parameters)  # Initialize the parameters randomly
+
+        self.local_convolution_layer.reset_parameters()
+        self.global_activation_function.reset_parameters()
 
         if use_vgg:
             # Use the pretrained VGG-16 model for the first
@@ -161,42 +204,48 @@ class DPNModel(BaseModel, nn.Module):
         :return: The result of the pass
         """
 
-        final_activation_function = nn.LogSoftmax(dim=1)
-
-        # Phase 1 (Groups 1 to 11)
+        # Phase 1: Unary terms
         unary_output = self.unary_terms_layers(input_tensor)
 
         if phase == 1:
-            return final_activation_function(unary_output)
+            return self.final_activation_function(unary_output)
+
+        # unary_output = functional.softmax(unary_output, dim=1)
 
         # Calculate the color distance tensor
         color_distance_tensor = self.color_distance_calculator(input_tensor)
-        if self.use_cuda:
-            color_distance_tensor = color_distance_tensor.to(device="cuda")
 
-        # Phase 2 (Adding group 12)
-        intermediate_output = self.local_convolution_layer(unary_output, color_distance_tensor).permute(0, 2, 3, 1)
-        intermediate_output = self.local_activation_function(intermediate_output).permute(0, 3, 1, 2)
+        # Phase 2: Adding triple penalty
+        # intermediate_output = self.local_convolution_layer(unary_output, color_distance_tensor).permute(0, 2, 3, 1)
+        # intermediate_output = self.local_activation_function(intermediate_output).permute(0, 3, 1, 2)
+
+        intermediate_output = self.local_convolution_layer(unary_output, color_distance_tensor)
+        intermediate_output = self.local_activation_function(intermediate_output)
 
         if phase == 2:
-            return final_activation_function(intermediate_output)
+            return self.final_activation_function(intermediate_output)
 
-        # Phase 3 (Adding groups 13 and 14)
-        intermediate_output = self.global_convolution_layer(intermediate_output).permute(0, 2, 3, 1)
-        intermediate_output = self.global_activation_function(intermediate_output).permute(0, 3, 1, 2)
+        # Phase 3: Adding local labels context
+        # intermediate_output = self.global_convolution_layer(intermediate_output).permute(0, 2, 3, 1)
+        # intermediate_output = self.global_activation_function(intermediate_output).permute(0, 3, 1, 2)
+
+        intermediate_output = self.global_convolution_layer(intermediate_output)
+        intermediate_output = self.global_activation_function(intermediate_output)
+
         smoothness_output = self.block_pooling(intermediate_output)
 
         if phase == 3:
-            return final_activation_function(smoothness_output)
+            return self.final_activation_function(smoothness_output)
 
-        # Phase 4 (Adding group 15 - Full)
-        output = torch.log(unary_output) - smoothness_output
+        # Phase 4: Combining both unary and smoothness terms
+        # output = torch.log(unary_output) - smoothness_output
+        output = functional.log_softmax(unary_output, dim=1) - smoothness_output
 
-        return final_activation_function(output)
+        return self.final_activation_function(output)
 
     def fit(self, images: List[Image.Image], labeled_images: List[Image.Image],
-            epochs: int = 80, learning_rate: float = 1e-5, batch_size: int = 1,
-            weight_path: Optional[str] = None, incremental: bool = True):
+            epochs: int = 80, learning_rate: float = 1e-5, batch_size: int = 1, incremental: bool = True,
+            output_weight_path: Optional[str] = None, saving_cycle: int = 10, input_weight_path: Optional[str] = None):
         """
         Train the model on the given images
 
@@ -205,8 +254,11 @@ class DPNModel(BaseModel, nn.Module):
         :param epochs: The number of epochs to train
         :param learning_rate: The rate for the optimizer
         :param batch_size: The size of each batch in the training process
-        :param weight_path: The path where the weights will be saved
-        :param incremental:
+        :param incremental: Whether or not to train the model using incremental learning
+        :param output_weight_path: The path where the weights will be saved
+        :param saving_cycle: Number of epochs before saving the model weights
+                (relevant only if output_weight_path is not None)
+        :param input_weight_path:
         """
 
         # Resize the annotated images and calculate the weight for the classes
@@ -222,9 +274,13 @@ class DPNModel(BaseModel, nn.Module):
             """
             if REPORT.Loss:
                 loss_list = []
+                if output_weight_path is not None:
+                    best_loss = float('inf')
+                    saving_counter = saving_cycle
 
             if REPORT.Time:
-                print(f"START PHASE {phase}")
+                if incremental:
+                    print(f"START PHASE {phase}")
                 start_time = time.time()
 
             for epoch in range(epochs):
@@ -236,16 +292,7 @@ class DPNModel(BaseModel, nn.Module):
                     start_epoch_time = time.time()
                     print(f"\tSTART EPOCH: {epoch}")
 
-                for batch_index, (image, labeled_image) in enumerate(zip(images, labeled_images)):
-                    # Transform the image and labeled_image into tensors
-                    image_tensor = self.preprocess(image)
-                    labels_tensor = torch.unsqueeze(torch.tensor(np.array(labeled_image), dtype=torch.long), dim=0)
-
-                    # Move to cuda if possible
-                    if self.use_cuda:
-                        image_tensor = image_tensor.to(device="cuda")
-                        labels_tensor = labels_tensor.to(device="cuda")
-
+                for batch_index, (image_tensor, labels_tensor) in enumerate(zip(images_tensors, labeled_tensors)):
                     prediction = self.forward(image_tensor, phase=phase)
 
                     loss = self.loss_function(prediction, labels_tensor) / batch_size
@@ -256,19 +303,31 @@ class DPNModel(BaseModel, nn.Module):
                         self.zero_grad()
 
                     if REPORT.Loss:
-                        epoch_loss += loss * batch_size
+                        epoch_loss += loss.item() * batch_size
 
                 if REPORT.Loss:
                     loss_list.append(epoch_loss)
                     print(f"\t\tLoss: {epoch_loss:.3f}")
 
+                    if SAVE_CHECKPOINT and output_weight_path is not None:
+                        if epoch_loss < best_loss:
+                            best_loss = epoch_loss
+                            if saving_counter <= 0:
+                                print(f"\t\tSaving epoch {epoch} at phase {phase}")
+                                torch.save({"epoch": epoch, "phase": phase, "loss": epoch_loss,
+                                            "model_state_dict": self.state_dict(),
+                                            "optimizer_state_dict": optimizer.state_dict(),
+                                            }, f"checkpoint_{output_weight_path}")
+                                saving_counter = saving_cycle
+                        saving_counter -= 1
+
                 if REPORT.Time:
                     end_epoch_time = time.time()
-                    print(f"\tEPOCH TIME: {end_epoch_time - start_epoch_time:.3f} sec")
+                    print(f"\t\tTIME: {end_epoch_time - start_epoch_time:.3f} sec")
 
             if REPORT.Time:
                 end_time = time.time()
-                print(f"TOTAL PHASE TIME: {end_time - start_time:.3f} sec")
+                print(f"\tTOTAL PHASE TIME: {end_time - start_time:.3f} sec")
 
             if REPORT.Loss:
                 plt.plot(loss_list)
@@ -280,11 +339,27 @@ class DPNModel(BaseModel, nn.Module):
 
         # Move the model to the GPU if possible
         self.use_cuda = torch.cuda.is_available()
+        device = "cpu"
         if self.use_cuda:
             self.cuda()
+            device = "cuda"
         print(f"Using cuda: {self.use_cuda}")
 
+        images_tensors = [self.preprocess(image).to(device=device) for image in images]
+        labeled_tensors = [torch.unsqueeze(torch.tensor(np.array(image), dtype=torch.long, device=device), dim=0)
+                           for image in labeled_images]
+
         optimizer = optimizationFunction(self.parameters(), lr=learning_rate)
+        if input_weight_path is not None:
+            weights = torch.load(input_weight_path)
+            try:
+                optimizer.load_state_dict(weights["optimizer_state_dict"])
+            except ValueError:
+                print("Could not load state_dict for the optimizer")
+            try:
+                self.load_state_dict(weights["model_state_dict"], strict=False)
+            except ValueError:
+                print("Could not load state_dict for the model")
 
         if incremental:
             for phase_index in range(self.NUM_PHASES):
@@ -310,19 +385,28 @@ class DPNModel(BaseModel, nn.Module):
         self.use_cuda = False
 
         # Save the model weights (if requested)
-        if weight_path is not None:
-            torch.save(self.state_dict(), weight_path)
+        if output_weight_path is not None:
+            print(f"\tSaving weights at {output_weight_path}")
+            torch.save({"model_state_dict": self.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict()
+                        }, output_weight_path)
+            print("\tSaved!")
 
-    def predict(self, image: Image.Image) -> Tensor:
+    def predict(self, image: Image.Image, phase: Optional[int] = None) -> Tensor:
         """
         Get the prediction for the given image
 
         :param image: The image to predict the annotations for
+        :param phase: Whether or not to use only part of the network for the prediction
         :return: A probability tensor, for each pixel there is a probability vector over the labels
         """
+
+        if phase is None:
+            phase = self.NUM_PHASES
+
         tensor = self.preprocess(image)
 
-        output = self.forward(tensor)
+        output = self.forward(tensor, phase=phase)
 
         return output
 
@@ -433,7 +517,7 @@ class DPNModel(BaseModel, nn.Module):
         return weights
 
     @staticmethod
-    def _color_distance(kernel_size: Tuple[int, int], channels: int = 3) -> Callable[[Image.Image], Tensor]:
+    def _color_distance(kernel_size: Tuple[int, int], channels: int = 3) -> Callable[[Tensor], Tensor]:
         """
         Get a function to calculate the color distance tensor
 
